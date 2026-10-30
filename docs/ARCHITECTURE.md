@@ -139,3 +139,27 @@ We chose this over "text with a short retention, deleted together with the repor
      once, backups included. This is the one that keeps "no recovery" strict, and the one we
      would choose.
 
+
+## Known limits
+
+### Brands with small volumes: most fine cuts are hidden
+
+Groups with fewer than 5 customers are hidden (k = 5). For a brand manager with a small
+volume, fine cuts are often hidden completely. For Alice (Calvin Klein and Diesel), US state
+by product category in September 2026 had 29 groups, and all 29 had fewer than 5 customers.
+
+Self-correction must not inflate costs here, and at first it did: the agent tried ever
+coarser groupings until it had used its whole budget. Now, after a result with every group
+hidden, the model gets one more query (a coarser grouping), whatever it shows. Then it must
+answer with what can be shown and suggest a coarser cut, for example by state only or by
+quarter. Further queries in the same step are not run at all, so they cost nothing.
+
+| The same question (eval case `small-groups-stop-early`) | Model calls | Queries | Cost | Time |
+|---|---|---|---|---|
+| Before the limit | 8 (the whole budget) | 6 | $0.0109 | 25 s |
+| With the limit | 6 | 3 | $0.0068 | 19 s |
+
+The rule only protects privacy and cost; it does not make small brands' data more useful.
+What production can add: check the group sizes of a few candidate cuts in one query and offer
+the finest cut that shows data; combine small groups into an "Other" row; or answer with
+BigQuery differential privacy, which adds noise to small groups instead of hiding them.

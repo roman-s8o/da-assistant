@@ -17,7 +17,7 @@ from fakes import (
 )
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from da_assistant.agent import GIVE_UP, conversation_view
+from da_assistant.agent import ALL_HIDDEN_STOP, GIVE_UP, NOT_RUN, RETRY_DONE, conversation_view
 from da_assistant.config import UserProfile
 from da_assistant.guard import REPLIES
 from da_assistant.privacy import MASK
@@ -497,3 +497,69 @@ def test_a_new_question_cancels_a_waiting_delete():
 
     assert len(store.find(author="ceo")) == 1
     assert store.audit_log()[-1]["action"] == "delete cancelled"
+
+
+# Every group hidden ------------------------------------------------------------------
+
+
+def all_hidden(groups=29):
+    return ok(rows=pd.DataFrame({"state": []}), hidden_groups=groups)
+
+
+def test_after_two_fully_hidden_results_the_model_must_answer():
+    model = FakeModel(
+        query_call(call_id="a"),
+        query_call(call_id="b"),
+        answer("Too few customers per state; try by quarter."),
+    )
+    tool = FakeSqlTool(all_hidden(29), all_hidden(18))
+
+    result = make_agent(model, tool).ask("Revenue by state and category", thread_id="t")
+
+    assert len(tool.calls) == 2
+    assert "you may try once more with a coarser grouping" in last_message(model, 1).content
+    assert ALL_HIDDEN_STOP in last_message(model, 2).content
+    # The answer comes from a call without tools: 3 model calls, not the budget of 8.
+    assert [with_tools for with_tools, _ in model.calls] == [True, True, False]
+    assert result.llm_calls == 3
+
+
+def test_after_the_one_retry_the_model_must_answer_even_if_it_shows_rows():
+    model = FakeModel(
+        query_call(call_id="a"), query_call(call_id="b"), answer("By state only: ...")
+    )
+    tool = FakeSqlTool(all_hidden(29), ok(hidden_groups=3))
+
+    result = make_agent(model, tool).ask("q", thread_id="t")
+
+    assert len(tool.calls) == 2
+    assert RETRY_DONE in last_message(model, 2).content
+    assert ALL_HIDDEN_STOP not in last_message(model, 2).content
+    assert [with_tools for with_tools, _ in model.calls] == [True, True, False]
+    assert result.llm_calls == 3
+
+
+def test_queries_after_the_retry_in_the_same_batch_are_not_run():
+    calls = [query_call(call_id=c).tool_calls[0] for c in ("b", "c", "d")]
+    model = FakeModel(query_call(call_id="a"), AIMessage("", tool_calls=calls), answer("x"))
+    tool = FakeSqlTool(all_hidden(29), ok())
+
+    make_agent(model, tool).ask("q", thread_id="t")
+
+    # The first query and the one retry ran; the other two did not reach BigQuery.
+    assert len(tool.calls) == 2
+    replies = model.calls[2][1][-3:]
+    assert [m.content for m in replies[1:]] == [NOT_RUN, NOT_RUN]
+
+
+def test_queries_before_a_hidden_result_do_not_count():
+    model = FakeModel(
+        query_call(call_id="a"), query_call(call_id="b"), query_call(call_id="c"), answer("x")
+    )
+    tool = FakeSqlTool(ok(), all_hidden(29), all_hidden(18))
+
+    result = make_agent(model, tool).ask("q", thread_id="t")
+
+    assert len(tool.calls) == 3
+    assert ALL_HIDDEN_STOP in last_message(model, 3).content
+    assert result.llm_calls == 4

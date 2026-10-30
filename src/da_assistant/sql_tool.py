@@ -94,8 +94,9 @@ class QueryResult:
                 return (
                     f"The query returned no rows: every group has fewer than {MIN_GROUP_SIZE} "
                     f"customers (maybe none). {' '.join(notes)} If a text filter may be "
-                    "misspelled, check the stored values; otherwise tell the user, and do "
-                    "not try to get around it."
+                    "misspelled, check the stored values. Otherwise you may try once more "
+                    "with a coarser grouping: fewer columns or a longer period, for example "
+                    "by state only or by quarter. Do not try to get around the rule."
                 )
             return " ".join([EMPTY_RESULT_HINT, *notes])
         shown = self.rows.head(max_rows)

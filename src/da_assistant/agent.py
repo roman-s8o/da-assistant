@@ -70,6 +70,20 @@ GIVE_UP = (
 # Questions and answers from earlier turns that the model still sees.
 EARLIER_MESSAGES = 20
 
+# After a result with every group hidden by the minimum group size, the model gets one more
+# query (a coarser grouping), whatever it shows. Then it must answer, so a question about a
+# small slice of data does not spend the whole budget on ever coarser groupings.
+RETRY_DONE = (
+    "That was the one retry after a result with every group hidden. Do not run more queries "
+    "for this question. Answer with what can be shown, and suggest a coarser cut to the "
+    "user, for example by state only or by quarter."
+)
+ALL_HIDDEN_STOP = "Every group is hidden again. " + RETRY_DONE
+NOT_RUN = (
+    "Not run: the one retry after a result with every group hidden is used. Answer with "
+    "what can be shown."
+)
+
 
 class QueryLog(TypedDict):
     purpose: str
@@ -100,6 +114,10 @@ class AgentState(TypedDict):
     input_tokens: int
     output_tokens: int
     failed_queries: int
+    # Results with every group hidden by the minimum group size, and whether the one retry
+    # after the first of them is still open (1), used (0) or not needed yet (None).
+    all_hidden_results: int
+    hidden_retry_left: int | None
     bytes_scanned: int
     queries: list[QueryLog]
     # Values masked by the final check (the query results count their own).
@@ -238,6 +256,8 @@ class Agent:
             "input_tokens": 0,
             "output_tokens": 0,
             "failed_queries": 0,
+            "all_hidden_results": 0,
+            "hidden_retry_left": None,
             "bytes_scanned": 0,
             "queries": [],
             "masked_values": 0,
@@ -368,6 +388,7 @@ class Agent:
             # Keep the last model call for the answer.
             state["llm_calls"] + 1 < self.budget.max_llm_calls
             and state["failed_queries"] <= self.budget.max_sql_retries
+            and state["hidden_retry_left"] != 0
             and state["bytes_scanned"] < self.budget.max_bytes
         )
 
@@ -403,6 +424,8 @@ class Agent:
         conversation_id = config["configurable"]["thread_id"]
         update: dict[str, Any] = {
             "failed_queries": state["failed_queries"],
+            "all_hidden_results": state["all_hidden_results"],
+            "hidden_retry_left": state["hidden_retry_left"],
             "bytes_scanned": state["bytes_scanned"],
             "queries": list(state["queries"]),
             "save_title": state["save_title"],
@@ -434,6 +457,9 @@ class Agent:
         return update
 
     def _run_sql(self, args: dict[str, Any], update: dict[str, Any], span: dict[str, Any]) -> str:
+        if update["hidden_retry_left"] == 0:
+            span.update(status="not run", reason="retry after hidden groups used")
+            return NOT_RUN
         bytes_left = self.budget.max_bytes - update["bytes_scanned"]
         model_sql = str(args.get("sql", ""))
         result = self.sql_tool.run(model_sql, bytes_left=bytes_left)
@@ -469,6 +495,14 @@ class Agent:
             )
         )
         content = result.for_model(self.rows_for_model)
+        all_hidden = result.ok and result.row_count == 0 and result.hidden_groups > 0
+        update["all_hidden_results"] += 1 if all_hidden else 0
+        if update["hidden_retry_left"] == 1:
+            # This query was the one retry: the model must answer now.
+            update["hidden_retry_left"] = 0
+            content += f"\n\n{ALL_HIDDEN_STOP if all_hidden else RETRY_DONE}"
+        elif all_hidden and update["hidden_retry_left"] is None:
+            update["hidden_retry_left"] = 1
         if update["failed_queries"] > self.budget.max_sql_retries:
             content += f"\n\n{GIVE_UP}"
         return content
@@ -700,6 +734,7 @@ def turn_record(
         "failed_queries": outcomes.count("failed") + outcomes.count("empty"),
         "rejected_queries": rejected,
         "empty_results": outcomes.count("empty"),
+        "all_hidden_results": state.get("all_hidden_results", 0),
         "self_corrected": self_corrected,
         "bytes_scanned": state.get("bytes_scanned", 0),
         "hidden_groups": max((q["hidden_groups"] for q in queries), default=0),

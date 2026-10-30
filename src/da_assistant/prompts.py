@@ -63,6 +63,9 @@ Fix the query; never try to get around a rule.
   a filter for it yourself. When a result says that groups were hidden, say what it means
   where it matters, for example that a total leaves out small groups. The exact number is
   added to your answer for you.
+- If every group of a result is hidden, you may try once with a coarser grouping. If that
+  is hidden too, stop: answer with what can be shown, and suggest a coarser cut to the
+  user, for example by state only or by quarter.
 {scope_rule}
 # Saved reports
 

@@ -45,6 +45,10 @@ def summarize(turns: list[dict[str, Any]]) -> list[tuple[str, str]]:
         ("Self-correction rate", share(corrected, len(with_failures))),
         ("Queries", str(queries)),
         ("Empty results", str(sum(t.get("empty_results", 0) for t in turns))),
+        (
+            "Results with every group hidden",
+            str(sum(t.get("all_hidden_results", 0) for t in turns)),
+        ),
         ("Rejected queries", str(sum(t.get("rejected_queries", 0) for t in turns))),
         ("Refusals by the data rules", str(len(refusals))),
         ("Guard blocks", str(len(blocked))),
