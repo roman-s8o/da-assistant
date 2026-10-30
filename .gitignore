@@ -1,0 +1,12 @@
+# Private notes, never committed
+notes/
+
+# Local secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/

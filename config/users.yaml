@@ -1,0 +1,14 @@
+# Who can use the assistant and which brands each person can analyze.
+# The dataset has no manager-to-brand mapping, so it lives here for the prototype.
+# Give each user either a list of `brands` or `all_brands: true`.
+
+users:
+  alice:
+    name: Alice (brand manager)
+    brands: [Calvin Klein, Diesel]
+  bob:
+    name: Bob (brand manager)
+    brands: [Carhartt]
+  ceo:
+    name: CEO
+    all_brands: true
