@@ -35,6 +35,7 @@ distro==1.9.0
     # via
     #   google-genai
     #   langsmith
+duckdb==2.0.0
 filetype==1.2.0
     # via langchain-google-genai
 google-api-core==2.43.2

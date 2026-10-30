@@ -88,6 +88,11 @@ class UserProfile(BaseModel):
             raise ValueError("set exactly one of: a list of 'brands', or 'all_brands: true'")
         return self
 
+    @property
+    def brand_scope(self) -> tuple[str, ...] | None:
+        """The brands this user can analyze. None means all brands."""
+        return None if self.all_brands else self.brands
+
     def scope_text(self) -> str:
         return "all brands" if self.all_brands else ", ".join(self.brands)
 

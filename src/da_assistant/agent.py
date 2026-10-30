@@ -119,7 +119,9 @@ class Agent:
         warehouse = Warehouse.from_settings(settings)
         return cls(
             model=chat_model(settings),
-            sql_tool=SqlTool(warehouse, max_result_rows=settings.max_result_rows),
+            sql_tool=SqlTool(
+                warehouse, brands=user.brand_scope, max_result_rows=settings.max_result_rows
+            ),
             user=user,
             schema=schema_text(warehouse.dataset, column_types(warehouse)),
             budget=Budget(

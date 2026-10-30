@@ -99,6 +99,29 @@ _TABLES = (
 
 TABLES: dict[str, Table] = {table.name: table for table in _TABLES}
 
+# Direct personal data in BigQuery. These columns are never shown, never sent to the
+# model and cannot be used in a query, not even in a filter.
+DIRECT_PII = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "email",
+        "street_address",
+        "postal_code",
+        "latitude",
+        "longitude",
+        "user_geom",
+    }
+)
+
+# Columns about people. They can be used only in grouped results.
+PEOPLE_COLUMNS = frozenset(
+    column.name for table in _TABLES for column in table.columns if column.aggregate_only
+)
+
+# The customer id column of each table that has one.
+USER_KEYS = {"users": "id", "orders": "user_id", "order_items": "user_id"}
+
 JOINS = (
     "order_items.order_id = orders.order_id",
     "order_items.product_id = products.id",

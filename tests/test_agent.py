@@ -116,6 +116,18 @@ def test_system_prompt_has_schema_user_and_date():
     assert "Friday, 30 October 2026" in system.content
 
 
+def test_brand_manager_prompt_names_their_brands():
+    model = FakeModel(answer("x"))
+    agent = make_agent(model, FakeSqlTool())
+    agent.user = UserProfile(id="alice", name="Alice", brands=("Calvin Klein", "Diesel"))
+
+    agent.ask("q", thread_id="t")
+
+    system = model.calls[0][1][0].content
+    assert "They can analyze: Calvin Klein, Diesel." in system
+    assert "All tables already hold only the brands this user can analyze" in system
+
+
 def test_fixes_a_failed_query():
     model = FakeModel(query_call("SELEC 1"), query_call("SELECT 1", call_id="c2"), answer("Done."))
 

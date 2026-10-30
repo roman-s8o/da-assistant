@@ -2,7 +2,13 @@ import pandas as pd
 import pytest
 from google.api_core import exceptions as gcp_errors
 
-from da_assistant.sql_tool import EMPTY_RESULT_HINT, QueryResult, SqlTool, format_bytes
+from da_assistant.sql_tool import (
+    EMPTY_RESULT_HINT,
+    SMALL_GROUPS_NOTE,
+    QueryResult,
+    SqlTool,
+    format_bytes,
+)
 
 DS = "bigquery-public-data.thelook_ecommerce"
 GOOD_SQL = f"SELECT brand FROM `{DS}.products`"
@@ -32,7 +38,7 @@ class FakeWarehouse:
 
 
 def run(warehouse, sql=GOOD_SQL, bytes_left=10_000):
-    return SqlTool(warehouse, max_result_rows=1000).run(sql, bytes_left=bytes_left)
+    return SqlTool(warehouse, brands=None, max_result_rows=1000).run(sql, bytes_left=bytes_left)
 
 
 def test_good_query_runs_after_a_dry_run():
@@ -113,6 +119,25 @@ def test_for_model_shows_csv_and_says_when_rows_are_cut():
         "A,1234.57",
         "B,0.01235",
     ]
+
+
+def test_people_queries_tell_the_model_that_small_groups_are_hidden():
+    sql = f"SELECT state, COUNT(*) AS n FROM `{DS}.users` GROUP BY state"
+    warehouse = FakeWarehouse(rows=pd.DataFrame({"state": ["California"], "n": [6]}))
+
+    result = run(warehouse, sql=sql)
+
+    assert result.hides_small_groups
+    assert SMALL_GROUPS_NOTE in result.for_model(50).splitlines()[0]
+    assert "HAVING COUNT(DISTINCT" in warehouse.calls[0][1]
+
+
+def test_brand_scope_is_applied():
+    warehouse = FakeWarehouse()
+
+    SqlTool(warehouse, brands=("Diesel",), max_result_rows=10).run(GOOD_SQL, bytes_left=10_000)
+
+    assert "brand IN ('Diesel')" in warehouse.calls[0][1]
 
 
 def test_for_model_error():
