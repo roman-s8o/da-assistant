@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -8,6 +9,7 @@ from da_assistant.agent import GIVE_UP, Agent, Budget, conversation_view
 from da_assistant.config import UserProfile
 from da_assistant.guard import REPLIES, GuardResult
 from da_assistant.privacy import MASK
+from da_assistant.reports import ReportStore
 from da_assistant.sql_tool import QueryResult
 
 USER = UserProfile(id="ceo", name="CEO", all_brands=True)
@@ -86,12 +88,14 @@ class FakeSqlTool:
         return self.results.pop(0)
 
 
-def make_agent(model, sql_tool, guard=None, **limits):
+def make_agent(model, sql_tool, guard=None, reports=None, **limits):
     budget = Budget(**({"max_llm_calls": 8, "max_sql_retries": 2, "max_bytes": 10_000} | limits))
     return Agent(
         model=model,
         guard=guard or FakeGuard(),
         sql_tool=sql_tool,
+        # The tests run in a temporary folder, so each test gets its own database.
+        reports=reports or ReportStore(Path("reports.db")),
         user=USER,
         schema="THE SCHEMA",
         budget=budget,
@@ -380,3 +384,205 @@ def test_hidden_groups_of_several_queries_are_not_added_up(counts, note):
 
     assert result.answer == f"x\n\n*Privacy note: {note}*"
     assert result.hidden_groups == max(counts)
+
+
+# Saved reports -------------------------------------------------------------------
+
+
+def tool_call(name, call_id="r1", **args):
+    return AIMessage(
+        "", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
+    )
+
+
+def save_some(store, *titles, conversation="t"):
+    return [
+        store.save(author="ceo", conversation_id=conversation, title=title, content=f"{title} text")
+        for title in titles
+    ]
+
+
+def test_save_report_saves_the_checked_final_answer():
+    model = FakeModel(
+        tool_call("save_report", title="Q3 report"), answer("Summary: write to jane@example.com")
+    )
+    agent = make_agent(model, FakeSqlTool())
+
+    result = agent.ask("Make a Q3 report", thread_id="t")
+
+    saved = agent.reports.get(author="ceo", report_id=result.saved_report)
+    assert (saved.title, saved.conversation_id) == ("Q3 report", "t")
+    # The saved text is the masked one, without the app's "saved" note.
+    assert saved.content == f"Summary: write to {MASK}"
+    assert result.answer.endswith(f"*Saved as report #{saved.id}: Q3 report.*")
+    assert "Write the full report now" in last_message(model, 1).content
+
+
+def test_save_report_can_save_the_last_answer():
+    model = FakeModel(
+        answer("Diesel made $8,025."),
+        tool_call("save_report", title="Diesel", which="last answer"),
+        answer("Saved it."),
+    )
+    agent = make_agent(model, FakeSqlTool())
+    agent.ask("Diesel revenue?", thread_id="t")
+
+    result = agent.ask("Save that as a report", thread_id="t")
+
+    assert (
+        agent.reports.get(author="ceo", report_id=result.saved_report).content
+        == "Diesel made $8,025."
+    )
+    assert result.answer == "Saved it."
+
+
+def test_list_and_open_reports_show_only_the_users_reports():
+    store = ReportStore(Path("reports.db"))
+    mine = save_some(store, "Q3 report")[0]
+    other = store.save(author="alice", conversation_id="x", title="Alice's", content="secret")
+    model = FakeModel(
+        AIMessage(
+            "",
+            tool_calls=[
+                {"name": "list_reports", "args": {}, "id": "a", "type": "tool_call"},
+                {
+                    "name": "open_report",
+                    "args": {"report_id": other.id},
+                    "id": "b",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "open_report",
+                    "args": {"report_id": mine.id},
+                    "id": "c",
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        answer("x"),
+    )
+
+    make_agent(model, FakeSqlTool(), reports=store).ask("My reports?", thread_id="t")
+
+    listed, other_text, mine_text = (m.content for m in model.calls[1][1][-3:])
+    assert f"#{mine.id} | Q3 report" in listed and "Alice" not in listed
+    assert other_text == f"There is no report #{other.id} in the user's library."
+    assert "Q3 report text" in mine_text
+
+
+def delete_flow(store, typed, clock_advance=None, **delete_args):
+    model = FakeModel(tool_call("delete_reports", **delete_args), answer("Done."))
+    agent = make_agent(model, FakeSqlTool(), reports=store)
+    waiting = agent.ask("Delete them", thread_id="t")
+    if clock_advance:
+        clock_advance()
+    return model, agent, waiting, agent.resume(typed, thread_id="t")
+
+
+def test_delete_waits_for_the_user_and_deletes_after_yes():
+    store = ReportStore(Path("reports.db"))
+    keep, *gone = save_some(store, "Top customers", "Diesel Q3", "Diesel Q2")
+    model = FakeModel(tool_call("delete_reports", search="diesel"), answer("Deleted 2 reports."))
+    agent = make_agent(model, FakeSqlTool(), reports=store)
+
+    waiting = agent.ask("Delete all reports mentioning Diesel", thread_id="t")
+
+    # The turn stops before anything is deleted, and the model has not seen a result.
+    assert [r["title"] for r in waiting.confirmation.reports] == ["Diesel Q3", "Diesel Q2"]
+    assert waiting.confirmation.word == "yes"
+    assert waiting.answer == ""
+    assert len(store.find(author="ceo")) == 3
+    assert len(model.calls) == 1
+
+    done = agent.resume("yes", thread_id="t")
+
+    assert done.confirmation is None
+    assert set(done.deleted_reports) == {r.id for r in gone}
+    assert [r.id for r in store.find(author="ceo")] == [keep.id]
+    assert "The user confirmed. Deleted 2 reports" in last_message(model, 1).content
+    assert done.answer == "Deleted 2 reports."
+
+
+@pytest.mark.parametrize("typed", ["no", "", "yes please", "y", "delete"])
+def test_anything_but_the_confirmation_word_keeps_the_reports(typed):
+    store = ReportStore(Path("reports.db"))
+    save_some(store, "Diesel Q3")
+
+    model, _, _, done = delete_flow(store, typed, search="diesel")
+
+    assert len(store.find(author="ceo")) == 1
+    assert done.deleted_reports == ()
+    assert last_message(model, 1).content == "The user did not confirm. Nothing was deleted."
+
+
+def test_many_reports_need_the_number_typed():
+    store = ReportStore(Path("reports.db"))
+    save_some(store, "A", "B", "C", "D")
+
+    _, _, waiting, done = delete_flow(store, "yes", all_reports=True)
+    assert waiting.confirmation.word == "4"
+    assert len(store.find(author="ceo")) == 4
+
+    _, _, _, done = delete_flow(store, " 4 ", all_reports=True)
+    assert len(done.deleted_reports) == 4
+    assert store.find(author="ceo") == []
+
+
+def test_a_late_confirmation_deletes_nothing():
+    clock = [datetime(2026, 10, 30, 12, 0, tzinfo=UTC)]
+    store = ReportStore(Path("reports.db"), confirm_ttl_s=60, now=lambda: clock[0])
+    save_some(store, "Diesel Q3")
+
+    def wait_too_long():
+        clock[0] += timedelta(seconds=61)
+
+    model, _, _, done = delete_flow(store, "yes", clock_advance=wait_too_long, search="diesel")
+
+    assert len(store.find(author="ceo")) == 1
+    assert "expired" in last_message(model, 1).content
+
+
+def test_delete_this_conversation_and_by_ids():
+    store = ReportStore(Path("reports.db"))
+    here = save_some(store, "Here 1", "Here 2", conversation="t")
+    save_some(store, "Earlier", conversation="old")
+
+    _, _, waiting, _ = delete_flow(store, "no", this_conversation=True)
+    assert [r["id"] for r in waiting.confirmation.reports] == [r.id for r in here]
+
+    _, _, waiting, _ = delete_flow(store, "no", report_ids=[here[1].id])
+    assert [r["id"] for r in waiting.confirmation.reports] == [here[1].id]
+
+
+def test_delete_never_touches_another_users_reports():
+    store = ReportStore(Path("reports.db"))
+    other = store.save(author="alice", conversation_id="t", title="Diesel", content="x")
+
+    model = FakeModel(tool_call("delete_reports", report_ids=[other.id]), answer("x"))
+    result = make_agent(model, FakeSqlTool(), reports=store).ask("Delete report", thread_id="t")
+
+    assert result.confirmation is None
+    assert "nothing needs to be deleted" in last_message(model, 1).content
+    assert store.get(author="alice", report_id=other.id) is not None
+
+
+def test_delete_needs_a_filter():
+    model = FakeModel(tool_call("delete_reports"), answer("x"))
+
+    result = make_agent(model, FakeSqlTool()).ask("Delete", thread_id="t")
+
+    assert result.confirmation is None
+    assert "say which reports to delete" in last_message(model, 1).content
+
+
+def test_a_new_question_cancels_a_waiting_delete():
+    store = ReportStore(Path("reports.db"))
+    save_some(store, "Diesel Q3")
+    model = FakeModel(tool_call("delete_reports", search="diesel"), answer("Revenue was $1."))
+    agent = make_agent(model, FakeSqlTool(), reports=store)
+    agent.ask("Delete Diesel reports", thread_id="t")
+
+    agent.ask("Actually, what was revenue?", thread_id="t")
+
+    assert len(store.find(author="ceo")) == 1
+    assert store.audit_log()[-1]["action"] == "delete cancelled"

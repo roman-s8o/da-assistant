@@ -2,6 +2,8 @@
 
 import logging
 import uuid
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -12,7 +14,7 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.table import Table
 
-from da_assistant.agent import Agent, TurnResult
+from da_assistant.agent import Agent, Confirmation, TurnResult
 from da_assistant.config import ConfigError, Settings, UserProfile, load_settings, load_users
 from da_assistant.errors import explain
 from da_assistant.evals import EvalOutcome, load_questions, run_eval, wilson_interval
@@ -28,8 +30,9 @@ app = typer.Typer(
 console = Console()
 
 CHAT_HELP = """Commands:
-  /help   show this help
-  /exit   end the session (Ctrl+D works too)"""
+  /help      show this help
+  /reports   list your saved reports
+  /exit      end the session (Ctrl+D works too)"""
 
 
 @app.callback()
@@ -90,6 +93,9 @@ def chat(
             break
         if text == "/help":
             console.print(CHAT_HELP)
+            continue
+        if text == "/reports":
+            _show_reports(agent, thread_id)
             continue
         _answer(agent, text, thread_id)
     console.print("\nBye.")
@@ -161,9 +167,16 @@ def eval_summary(outcomes: list[EvalOutcome]) -> str:
 def _answer(agent: Agent, question: str, thread_id: str) -> None:
     """Answer one question. Any error is shown, and the session goes on."""
     try:
-        with console.status("Thinking...") as status:
-            result = agent.ask(
-                question, thread_id=thread_id, on_progress=lambda text: status.update(escape(text))
+        result = _working(
+            lambda progress: agent.ask(question, thread_id=thread_id, on_progress=progress)
+        )
+        # A delete waits for the user. Only what the user types here can confirm it.
+        while result.confirmation:
+            typed = _ask_to_confirm(result.confirmation)
+            result = _working(
+                lambda progress, typed=typed: agent.resume(
+                    typed, thread_id=thread_id, on_progress=progress
+                )
             )
     except KeyboardInterrupt:
         console.print("[yellow]Stopped.[/]\n")
@@ -173,6 +186,56 @@ def _answer(agent: Agent, question: str, thread_id: str) -> None:
         return
     console.print(Markdown(result.answer or "I could not produce an answer. Please rephrase."))
     console.print(f"[dim]{escape(turn_summary(result))}[/]\n")
+
+
+def _working(run: Callable[[Callable[[str], None]], TurnResult]) -> TurnResult:
+    """Run a step of the agent with a spinner that shows its progress."""
+    with console.status("Thinking...") as status:
+        return run(lambda text: status.update(escape(text)))
+
+
+def _ask_to_confirm(confirmation: Confirmation) -> str:
+    """Show the exact reports a delete would remove, and return what the user types."""
+    count = len(confirmation.reports)
+    noun = "report" if count == 1 else "reports"
+    console.print(f"\n[bold red]Delete {count} {noun} for good?[/] This cannot be undone.")
+    table = Table("Id", "Title", "Saved")
+    for report in confirmation.reports:
+        saved = datetime.fromisoformat(report["created_at"]).astimezone()
+        table.add_row(f"#{report['id']}", escape(report["title"]), f"{saved:%Y-%m-%d %H:%M}")
+    console.print(table)
+    expires = datetime.fromisoformat(confirmation.expires_at).astimezone()
+    console.print(f"[dim]This request expires at {expires:%H:%M}.[/]")
+    if confirmation.word == "yes":
+        prompt = "Type [bold]yes[/] to delete, or anything else to keep them: "
+    else:
+        prompt = (
+            f"Type [bold]{confirmation.word}[/] (the number of reports) to delete them, "
+            "or anything else to keep them: "
+        )
+    try:
+        return console.input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return ""
+
+
+def _show_reports(agent: Agent, thread_id: str) -> None:
+    try:
+        reports = agent.saved_reports()
+    except Exception as exc:  # the chat must never crash
+        console.print(f"[red]Could not read your reports.[/] {escape(explain(exc))}\n")
+        return
+    if not reports:
+        console.print("You have no saved reports.\n")
+        return
+    table = Table("Id", "Title", "Saved", "Conversation")
+    for report in reports:
+        where = "this one" if report.conversation_id == thread_id else "earlier"
+        saved = f"{report.created_at.astimezone():%Y-%m-%d %H:%M}"
+        table.add_row(f"#{report.id}", escape(report.title), saved, where)
+    console.print(table)
+    console.print()
 
 
 _BLOCKED = {
@@ -195,6 +258,10 @@ def turn_summary(result: TurnResult) -> str:
         if failed:
             queries += f" ({failed} failed or empty)"
         parts.append(f"{queries}, {format_bytes(result.bytes_scanned)} scanned")
+    if result.saved_report:
+        parts.append(f"saved as report #{result.saved_report}")
+    if result.deleted_reports:
+        parts.append(_count(len(result.deleted_reports), "report deleted", "reports deleted"))
     if result.hidden_groups:
         parts.append(_count(result.hidden_groups, "small group hidden", "small groups hidden"))
     if result.masked_values:

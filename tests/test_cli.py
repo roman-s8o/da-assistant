@@ -1,10 +1,13 @@
+from datetime import UTC, datetime
+
 import pytest
 from typer.testing import CliRunner
 
 from da_assistant import cli
-from da_assistant.agent import QueryLog, TurnResult
+from da_assistant.agent import Confirmation, QueryLog, TurnResult
 from da_assistant.config import ConfigError
 from da_assistant.health import CheckResult
+from da_assistant.reports import Report
 
 runner = CliRunner()
 
@@ -34,16 +37,41 @@ def query(rows=1, error=None, hidden_groups=0):
 
 
 class FakeAgent:
-    def __init__(self, *outcomes):
+    def __init__(self, *outcomes, reports=()):
         self.outcomes = list(outcomes)
+        self.reports = list(reports)
         self.questions = []  # (question, thread_id)
+        self.typed = []  # what the user typed at confirmations
 
     def ask(self, question, *, thread_id, on_progress=None):
         self.questions.append((question, thread_id))
+        return self._next()
+
+    def resume(self, typed, *, thread_id, on_progress=None):
+        self.typed.append(typed)
+        return self._next()
+
+    def saved_reports(self):
+        return self.reports
+
+    def _next(self):
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+def waiting_for(word="yes", count=2):
+    reports = [
+        {"id": i, "title": f"Diesel Q{i}", "created_at": "2026-10-30T12:00:00+00:00"}
+        for i in range(1, count + 1)
+    ]
+    confirmation = Confirmation(reports, word, "2026-10-30T12:05:00+00:00")
+    return TurnResult("", [], 2, 10, 5, 0, 1.0, confirmation=confirmation)
+
+
+def deleted(*ids):
+    return TurnResult("Deleted.", [], 3, 10, 5, 0, 1.0, deleted_reports=ids)
 
 
 @pytest.fixture
@@ -109,6 +137,49 @@ def test_chat_help_and_end_of_input(use_agent):
     assert "/exit" in result.output
     assert agent.questions == []
     assert "Bye." in result.output
+
+
+def test_delete_shows_the_exact_list_and_passes_on_what_the_user_typed(use_agent):
+    agent = use_agent(FakeAgent(waiting_for(), deleted(1, 2)))
+
+    result = runner.invoke(
+        cli.app, ["chat", "--user", "ceo"], input="Delete Diesel reports\nyes\n/exit\n"
+    )
+
+    assert "Delete 2 reports for good? This cannot be undone." in result.output
+    assert "#1" in result.output and "Diesel Q2" in result.output
+    assert "Type yes to delete" in result.output
+    assert agent.typed == ["yes"]
+    assert "Deleted." in result.output
+    assert "2 reports deleted" in result.output
+
+
+def test_many_reports_ask_for_the_number(use_agent):
+    agent = use_agent(FakeAgent(waiting_for(word="5", count=5), deleted()))
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="Delete all\nno\n/exit\n")
+
+    assert "Type 5 (the number of reports) to delete them" in result.output
+    assert agent.typed == ["no"]
+
+
+def test_end_of_input_at_the_confirmation_keeps_the_reports(use_agent):
+    agent = use_agent(FakeAgent(waiting_for(), deleted()))
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="Delete Diesel reports\n")
+
+    assert result.exit_code == 0
+    assert agent.typed == [""]
+
+
+def test_reports_command_lists_saved_reports(use_agent):
+    saved = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    reports = [Report(12, "ceo", "other", "Q3 report", "text", saved)]
+    use_agent(FakeAgent(reports=reports))
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="/reports\n/exit\n")
+
+    assert "#12" in result.output and "Q3 report" in result.output and "earlier" in result.output
 
 
 def test_turn_summary():

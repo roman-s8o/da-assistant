@@ -66,6 +66,13 @@ class Settings(BaseSettings):
 
     users_file: Path = Path("config/users.yaml")
 
+    # Saved reports, pending deletes and the audit log.
+    db_path: Path = Path("data/assistant.db")
+    # How long a delete waits for the user's confirmation.
+    confirm_ttl_s: float = 300.0
+    # Deleting more reports than this needs the number typed, not just "yes".
+    confirm_count_above: int = 3
+
 
 def load_settings() -> Settings:
     try:

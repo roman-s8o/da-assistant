@@ -4,6 +4,9 @@ notes/
 # Local secrets
 .env
 
+# Local data: saved reports, the audit log
+data/
+
 # Python
 __pycache__/
 *.pyc
