@@ -101,8 +101,10 @@ class GuardResult:
 
 
 class Guard:
-    def __init__(self, model: BaseChatModel) -> None:
+    def __init__(self, model: BaseChatModel, *, model_name: str = "") -> None:
         self.classifier = model.with_structured_output(GuardVerdict, include_raw=True)
+        # For the traces and the cost estimate.
+        self.model_name = model_name
 
     def check(self, message: str, *, scope: str, last_answer: str = "") -> GuardResult:
         for rule in _INJECTION_RULES:

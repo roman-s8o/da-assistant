@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
     "sqlglot>=30.26.0",
+    "tenacity>=9.1.4",
     "typer>=0.27.3",
 ]
 

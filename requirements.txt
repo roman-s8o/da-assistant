@@ -255,6 +255,7 @@ sqlglot==30.26.0
     # via da-assistant
 tenacity==9.1.4
     # via
+    #   da-assistant
     #   google-genai
     #   langchain-core
 truststore==0.10.5 ; sys_platform != 'emscripten'

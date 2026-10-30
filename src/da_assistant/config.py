@@ -47,10 +47,18 @@ class Settings(BaseSettings):
 
     llm_model: str = "gemini-3.8-flash"
     llm_fallback_model: str = "gemini-3.5-flash-lite"
-    llm_timeout_s: float = 60.0
+    # Per attempt. A normal answer takes a few seconds; an overloaded model can take a minute
+    # to return an error.
+    llm_timeout_s: float = 30.0
+    # Retries of temporary errors, only within the retry window; then the fallback model.
     llm_attempts: int = 3
-    # A small, cheap model for the guard that checks every message first.
+    llm_retry_window_s: float = 10.0
+    # After the primary model fails, use the fallback model for this long.
+    llm_cooldown_s: float = 300.0
+    # A small, cheap model for the guard that checks every message first. Its call is tiny,
+    # and the guard lets the message through when the call fails, so it waits less.
     guard_model: str = "gemini-3.5-flash-lite"
+    guard_timeout_s: float = 10.0
 
     # Hard limits for every BigQuery job. BigQuery itself stops a job that goes over them.
     max_bytes_billed: int = 1_000_000_000
@@ -68,6 +76,8 @@ class Settings(BaseSettings):
 
     # Saved reports, pending deletes and the audit log.
     db_path: Path = Path("data/assistant.db")
+    # One JSON line per step of each turn. No question, answer or report text.
+    trace_path: Path = Path("data/traces.jsonl")
     # How long a delete waits for the user's confirmation.
     confirm_ttl_s: float = 300.0
     # Deleting more reports than this needs the number typed, not just "yes".

@@ -19,7 +19,9 @@ from da_assistant.config import ConfigError, Settings, UserProfile, load_setting
 from da_assistant.errors import explain
 from da_assistant.evals import EvalOutcome, load_questions, run_eval, wilson_interval
 from da_assistant.health import run_checks
+from da_assistant.metrics import summarize
 from da_assistant.sql_tool import format_bytes
+from da_assistant.tracing import TurnTrace, read_turns
 from da_assistant.warehouse import Warehouse
 
 app = typer.Typer(
@@ -32,6 +34,8 @@ console = Console()
 CHAT_HELP = """Commands:
   /help      show this help
   /reports   list your saved reports
+  /trace     show the last answer step by step
+  /stats     show the metrics of this session
   /exit      end the session (Ctrl+D works too)"""
 
 
@@ -96,6 +100,12 @@ def chat(
             continue
         if text == "/reports":
             _show_reports(agent, thread_id)
+            continue
+        if text == "/trace":
+            _show_trace(agent.last_trace)
+            continue
+        if text == "/stats":
+            _show_metrics(agent.tracer.turns, "This session")
             continue
         _answer(agent, text, thread_id)
     console.print("\nBye.")
@@ -162,6 +172,85 @@ def eval_summary(outcomes: list[EvalOutcome]) -> str:
     low, high = wilson_interval(passed, total)
     rate = passed / total if total else 0.0
     return f"{passed} of {total} passed ({rate:.0%}; 95% interval {low:.0%} to {high:.0%})."
+
+
+@app.command()
+def stats(
+    file: Annotated[Path | None, typer.Option(help="The trace file.")] = None,
+) -> None:
+    """Show the agent metrics of every turn in the trace file."""
+    path = file or _settings().trace_path
+    _show_metrics(read_turns(path), str(path))
+
+
+def _show_metrics(turns: list[dict], title: str) -> None:
+    table = Table("Metric", "Value", title=escape(title))
+    for name, value in summarize(turns):
+        table.add_row(name, value)
+    console.print(table)
+    console.print()
+
+
+def _show_trace(trace: TurnTrace | None) -> None:
+    if trace is None:
+        console.print("No answer to show yet.\n")
+        return
+    record = trace.record
+    console.print(
+        f"[bold]Trace {trace.trace_id}[/] · {record.get('latency_ms', 0) / 1000:.1f} s · "
+        f"${record.get('cost_usd', 0):.5f} · {escape(str(record.get('status', '')))}"
+    )
+    table = Table("Step", "ms", "What happened")
+    for span in trace.spans:
+        name = span["span"] if span["span"] != "tool" else f"tool: {span['tool']}"
+        table.add_row(escape(name), str(span.get("ms", "")), escape(span_details(span)))
+    console.print(table)
+    console.print()
+
+
+def span_details(span: dict) -> str:
+    """One readable cell about a step of a trace."""
+    kind = span["span"]
+    tokens = f"{span.get('input_tokens', 0):,} in / {span.get('output_tokens', 0):,} out"
+    if kind == "guard":
+        text = f"{span.get('category')} ({span.get('source')}), {span.get('model')}, {tokens}"
+    elif kind == "agent":
+        model = span.get("model", "?") + (" (fallback)" if span.get("fallback") else "")
+        text = f"{model}, {_count(span.get('attempts', 1), 'attempt', 'attempts')}"
+        if span.get("model_errors"):
+            text += f" (errors: {', '.join(span['model_errors'])})"
+        if span.get("skipped_primary"):
+            text += " (primary model resting after a failure)"
+        calls = span.get("tool_calls") or []
+        text += f", {tokens} -> " + (", ".join(calls) if calls else "answer")
+    elif kind == "tool" and span.get("tool") == "run_sql":
+        text = f"{span.get('purpose', '')}\n{span.get('rows', 0)} rows, "
+        text += f"{format_bytes(span.get('bytes', 0))}"
+        if span.get("hidden_groups"):
+            text += f", {span['hidden_groups']} small groups hidden"
+        if span.get("masked_values"):
+            text += f", {span['masked_values']} values masked"
+        if span.get("error"):
+            text += f"\nERROR: {span['error']}"
+        text += f"\n{span.get('sql', '')[:300]}"
+    elif kind == "tool":
+        ids = span.get("report_ids") or ([span["report_id"]] if span.get("report_id") else [])
+        text = f"reports {', '.join(f'#{i}' for i in ids) or 'none'}"
+    elif kind == "confirm_delete":
+        ids = ", ".join(f"#{i}" for i in span.get("report_ids", [])) or "none"
+        text = f"{span.get('outcome')}: {ids}"
+    elif kind == "final_check":
+        answer = span.get("answer", {})
+        text = f"answer {answer.get('chars', 0):,} chars, {span.get('masked_values', 0)} masked"
+        if span.get("leak"):
+            text += ", replaced: it quoted the instructions"
+        if span.get("saved_report"):
+            text += f", saved as report #{span['saved_report']}"
+    else:
+        text = ""
+    if span.get("status") == "error":
+        text += f"\nERROR: {span.get('error_type')}: {span.get('error', '')}"
+    return text
 
 
 def _answer(agent: Agent, question: str, thread_id: str) -> None:
@@ -266,10 +355,12 @@ def turn_summary(result: TurnResult) -> str:
         parts.append(_count(result.hidden_groups, "small group hidden", "small groups hidden"))
     if result.masked_values:
         parts.append(_count(result.masked_values, "value masked", "values masked"))
-    parts.append(
-        f"{_count(result.llm_calls, 'model call', 'model calls')}, "
-        f"{result.input_tokens:,} tokens in, {result.output_tokens:,} out"
-    )
+    calls = _count(result.llm_calls, "model call", "model calls")
+    if result.fallback:
+        calls += " (fallback model)"
+    parts.append(f"{calls}, {result.input_tokens:,} tokens in, {result.output_tokens:,} out")
+    if result.cost_usd:
+        parts.append(f"${result.cost_usd:.4f}")
     parts.append(f"{result.seconds:.1f} s")
     return " · ".join(parts)
 

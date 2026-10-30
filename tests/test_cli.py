@@ -8,6 +8,7 @@ from da_assistant.agent import Confirmation, QueryLog, TurnResult
 from da_assistant.config import ConfigError
 from da_assistant.health import CheckResult
 from da_assistant.reports import Report
+from da_assistant.tracing import Tracer
 
 runner = CliRunner()
 
@@ -40,6 +41,8 @@ class FakeAgent:
     def __init__(self, *outcomes, reports=()):
         self.outcomes = list(outcomes)
         self.reports = list(reports)
+        self.tracer = Tracer(None, user_id="ceo")
+        self.last_trace = None
         self.questions = []  # (question, thread_id)
         self.typed = []  # what the user typed at confirmations
 
@@ -241,3 +244,64 @@ def test_bad_settings_give_a_clear_error(monkeypatch):
 
     assert result.exit_code == 2
     assert "Invalid settings" in result.output
+
+
+def finished_trace():
+    tracer = Tracer(None, user_id="ceo")
+    trace = tracer.new_turn("t")
+    with trace.span("guard", model="lite") as span:
+        span.update(category="analysis", source="model", input_tokens=300, output_tokens=30)
+    with trace.span("agent") as span:
+        span.update(model="lite", fallback=True, attempts=2, model_errors=["503"])
+        span.update(input_tokens=1000, output_tokens=50, tool_calls=["run_sql"])
+    with trace.span("tool", tool="run_sql") as span:
+        span.update(purpose="revenue by state", rows=34, bytes=6_400_000, hidden_groups=12)
+        span.update(sql="SELECT state FROM users")
+    with trace.span("final_check") as span:
+        span.update(answer={"sha256": "x", "chars": 420}, masked_values=0, saved_report=7)
+    trace.finish(status="ok", cost_usd=0.0012, answered=True)
+    return tracer, trace
+
+
+def test_trace_command_shows_each_step(use_agent):
+    agent = FakeAgent()
+    agent.tracer, agent.last_trace = finished_trace()
+    use_agent(agent)
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="/trace\n/exit\n")
+
+    assert f"Trace {agent.last_trace.trace_id}" in result.output
+    assert "lite (fallback), 2 attempts (errors: 503)" in result.output
+    assert "34 rows, 6.4 MB, 12 small groups hidden" in result.output
+    assert "saved as report #7" in result.output
+
+
+def test_trace_command_before_any_answer(use_agent):
+    use_agent(FakeAgent())
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="/trace\n/exit\n")
+
+    assert "No answer to show yet." in result.output
+
+
+def test_stats_command_shows_session_metrics(use_agent):
+    agent = FakeAgent()
+    agent.tracer, _ = finished_trace()
+    use_agent(agent)
+
+    result = runner.invoke(cli.app, ["chat", "--user", "ceo"], input="/stats\n/exit\n")
+
+    assert "Answer success rate" in result.output
+    assert "100% (1 of 1)" in result.output
+
+
+def test_stats_command_reads_the_trace_file(tmp_path):
+    path = tmp_path / "traces.jsonl"
+    tracer = Tracer(path, user_id="ceo")
+    tracer.new_turn("t").finish(status="ok", answered=True, latency_ms=2500)
+
+    result = runner.invoke(cli.app, ["stats", "--file", str(path)])
+
+    assert result.exit_code == 0
+    assert "Questions" in result.output
+    assert "2.5 s / 2.5 s" in result.output
