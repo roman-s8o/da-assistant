@@ -1,0 +1,28 @@
+# Eval questions with known answers.
+#
+# For each question, `da-assistant eval` runs the reference `sql` to get the expected
+# value, asks the agent the question as `user`, and passes the question when a number
+# in the answer is within `tolerance` of the expected value.
+# The data can still change (for example, an item sold in September is returned later),
+# so the reference SQL is the source of truth. `expected` is the value on `as_of`;
+# the eval warns when the reference SQL no longer gives it.
+
+questions:
+  - id: diesel-revenue-2026-09
+    user: ceo
+    question: >-
+      What was the revenue of the Diesel brand in September 2026?
+      Give the exact amount in US dollars.
+    # The date of a sale is order_items.created_at. Dating sales by orders.created_at
+    # gives $8,011.09, which is wrong: the agent did this in a chat on 2026-10-30.
+    sql: |
+      SELECT SUM(oi.sale_price) AS revenue
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+      WHERE p.brand = 'Diesel'
+        AND oi.status NOT IN ('Cancelled', 'Returned')
+        AND oi.created_at >= TIMESTAMP('2026-09-01')
+        AND oi.created_at < TIMESTAMP('2026-10-01')
+    expected: 8024.59
+    as_of: 2026-10-30
+    tolerance: 1.0

@@ -5,6 +5,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 USERS_FILE = ROOT / "config" / "users.yaml"
+QUESTIONS_FILE = ROOT / "evals" / "questions.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -22,3 +23,9 @@ def isolated_env(monkeypatch, tmp_path):
 def users_file() -> Path:
     """The users file shipped with the project."""
     return USERS_FILE
+
+
+@pytest.fixture
+def questions_file() -> Path:
+    """The eval question set shipped with the project."""
+    return QUESTIONS_FILE

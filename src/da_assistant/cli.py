@@ -1,7 +1,8 @@
-"""Command line interface: `da-assistant check` and `da-assistant chat`."""
+"""Command line interface: `da-assistant check`, `chat` and `eval`."""
 
 import logging
 import uuid
+from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
@@ -14,8 +15,10 @@ from rich.table import Table
 from da_assistant.agent import Agent, TurnResult
 from da_assistant.config import ConfigError, Settings, UserProfile, load_settings, load_users
 from da_assistant.errors import explain
+from da_assistant.evals import EvalOutcome, load_questions, run_eval, wilson_interval
 from da_assistant.health import run_checks
 from da_assistant.sql_tool import format_bytes
+from da_assistant.warehouse import Warehouse
 
 app = typer.Typer(
     help="Data analysis chat assistant for the thelook_ecommerce dataset.",
@@ -92,6 +95,69 @@ def chat(
     console.print("\nBye.")
 
 
+@app.command("eval")
+def eval_command(
+    file: Annotated[Path, typer.Option(help="The question set.")] = Path("evals/questions.yaml"),
+    only: Annotated[str | None, typer.Option(help="Run only the question with this id.")] = None,
+) -> None:
+    """Ask the agent the eval questions and score the answers. Uses BigQuery and Gemini."""
+    settings = _settings()
+    users = _users(settings)
+    try:
+        questions = load_questions(file)
+    except ConfigError as exc:
+        _fail(str(exc))
+    if only:
+        questions = [question for question in questions if question.id == only]
+        if not questions:
+            _fail(f"No question with id '{only}' in {file}.")
+    try:
+        warehouse = Warehouse.from_settings(settings)
+    except Exception as exc:  # setup errors end the run with a clear message
+        _fail(explain(exc))
+
+    with console.status("Running the eval...") as status:
+        outcomes = run_eval(
+            questions,
+            users=users,
+            warehouse=warehouse,
+            make_agent=lambda user: Agent.from_settings(settings, user),
+            on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
+        )
+
+    table = Table("", "Question", "Expected", "Answer", show_lines=True)
+    for outcome in outcomes:
+        status_text = "[green]PASS[/]" if outcome.passed else "[red]FAIL[/]"
+        table.add_row(status_text, escape(outcome.question.id), *_eval_cells(outcome))
+    console.print(table)
+    console.print(eval_summary(outcomes))
+    if not all(outcome.passed for outcome in outcomes):
+        raise typer.Exit(1)
+
+
+def _eval_cells(outcome: EvalOutcome) -> tuple[str, str]:
+    question = outcome.question
+    if outcome.reference is None:
+        expected = "?"
+    else:
+        expected = f"{outcome.reference:,.2f}"
+        if outcome.reference_changed:
+            expected += f"\n(was {question.expected:,.2f} on {question.as_of})"
+    if outcome.error:
+        answer = f"ERROR: {outcome.error}"
+    else:
+        answer = outcome.turn.answer[:300] + "\n" + turn_summary(outcome.turn)
+    return escape(expected), escape(answer)
+
+
+def eval_summary(outcomes: list[EvalOutcome]) -> str:
+    passed = sum(outcome.passed for outcome in outcomes)
+    total = len(outcomes)
+    low, high = wilson_interval(passed, total)
+    rate = passed / total if total else 0.0
+    return f"{passed} of {total} passed ({rate:.0%}; 95% interval {low:.0%} to {high:.0%})."
+
+
 def _answer(agent: Agent, question: str, thread_id: str) -> None:
     """Answer one question. Any error is shown, and the session goes on."""
     try:
@@ -134,11 +200,15 @@ def _settings() -> Settings:
         _fail(str(exc))
 
 
-def _user(settings: Settings, user_id: str) -> UserProfile:
+def _users(settings: Settings) -> dict[str, UserProfile]:
     try:
-        users = load_users(settings.users_file)
+        return load_users(settings.users_file)
     except ConfigError as exc:
         _fail(str(exc))
+
+
+def _user(settings: Settings, user_id: str) -> UserProfile:
+    users = _users(settings)
     if user_id not in users:
         _fail(f"Unknown user '{user_id}'. Known users: {', '.join(users)}.")
     return users[user_id]
