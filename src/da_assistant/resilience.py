@@ -1,7 +1,8 @@
 """Retries and the fallback model for every Gemini call.
 
-Measured on 2026-10-30, during an outage of the primary model: a 503 came back after
-23 to 56 seconds. So retrying an overloaded model mostly makes the user wait. The policy:
+Measured on 2026-10-30, during an outage of the primary model: a single attempt failed
+after 21 to 58 seconds (one HTTP request each; how it was measured is in
+docs/ARCHITECTURE.md). So retrying an overloaded model mostly makes the user wait. The policy:
 
 - Temporary errors (408, 429, 5xx, timeouts, lost connections) are retried with
   exponential backoff and jitter, but only while less than `retry_window_s` has passed

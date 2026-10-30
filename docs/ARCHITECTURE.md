@@ -38,8 +38,9 @@ What this means for the design:
 
 ### What the agent does now
 
-A later measurement during the same outage changed one detail: a 503 came back only after
-23 to 56 seconds. Retrying a model that fails this slowly mostly makes the user wait. So:
+A later measurement during the same outage changed one detail: a single attempt failed only
+after 21 to 58 seconds (see "How the timing was measured" below). Retrying a model that fails
+this slowly mostly makes the user wait. So:
 
 - Temporary errors are retried only while less than 10 seconds have passed since the first
   attempt (`DA_LLM_RETRY_WINDOW_S`). A quick 429 gets a retry; a slow 503 goes straight to
@@ -59,6 +60,29 @@ A later measurement during the same outage changed one detail: a 503 came back o
 Live run with the primary model still down: the first question fell back after one 503 and
 was answered in 32 s; the second question skipped the primary model and took 18 s.
 Both answers were correct, and the trace shows each step (`/trace`).
+
+### How the timing was measured
+
+The time to a failure only means something if it is one attempt, not several retries inside
+the SDK. So each call went to `gemini-3.8-flash` through LangChain's `ChatGoogleGenerativeAI`
+with `max_retries=1`. LangChain passes this to the google-genai SDK as
+`HttpRetryOptions(attempts=1)`, which the SDK documents as "including the original request;
+0 or 1 means no retries". The SDK's other, implicit retries cover only lost connections in
+async code, and they are off when retry options are set. The client timeout was 60 seconds.
+To be sure, we counted the HTTP requests of each call by wrapping `httpx.Client.send`.
+
+| When (2026-10-30) | SDK setting | HTTP requests | Result | Time to the error |
+|---|---|---|---|---|
+| First measurement | `max_retries=1` | 1 | 503 UNAVAILABLE | 56.5 s |
+| First measurement | `max_retries=1` | 1 | 503 UNAVAILABLE | 23.1 s |
+| Check, 17:05 CET | `max_retries=1` | 1 | 503 UNAVAILABLE | 20.8 s |
+| Check, 17:05 CET | `max_retries=1` | 1 | 504 DEADLINE_EXCEEDED | 58.1 s |
+| Check, 17:05 CET | `max_retries=3` | 3 (58.6 s, 58.8 s, 58.6 s) | 504 DEADLINE_EXCEEDED | 180.3 s |
+
+The last row is the setting the agent had before: three SDK attempts made the user wait three
+minutes for one error. Now the SDK makes one attempt, our own retry layer decides what happens
+next, and every attempt shows in the traces. With the 30-second timeout, a slow failure costs
+at most 30 seconds before the fallback model answers.
 
 ## Where data lives
 
