@@ -10,7 +10,8 @@ can act on. The rules, in order:
    the model; the safe views enforce the scope anyway).
 5. Columns about people (city, state, country, age, gender, traffic_source) only in the
    final SELECT, which must group or aggregate. Customer ids may appear there only
-   inside COUNT or in JOIN conditions. Groups with fewer than 5 customers are removed.
+   inside COUNT or in JOIN conditions. Groups with fewer than 5 customers are removed
+   inside BigQuery, and the query also returns how many groups were removed.
 6. Every table is replaced with its safe view (`views.py`): only allowed columns,
    only the user's brands. This is the guarantee for rules 3 and 4.
 7. A limit on the number of rows.
@@ -27,6 +28,10 @@ from da_assistant.schema import DIRECT_PII, PEOPLE_COLUMNS, TABLES, USER_KEYS
 from da_assistant.views import apply_views
 
 MIN_GROUP_SIZE = 5
+
+# A column added to queries about people: the number of groups removed because they
+# have fewer than MIN_GROUP_SIZE customers. SqlTool takes it out of the result.
+HIDDEN_GROUPS_COLUMN = "_hidden_groups"
 
 _WRITES = (
     exp.Insert,
@@ -64,6 +69,12 @@ _GROUP_SUMMARIES = (
 
 _PEOPLE = "city, state, country, age, gender or traffic_source"
 
+_TWO_WAYS = (
+    "There are two allowed ways: list single customers by customer id without these "
+    "columns (for example top customers by spend), or group by these columns without "
+    "customer ids (for example customers and revenue by state)."
+)
+
 
 class SqlRejected(ValueError):
     """The query breaks a rule. The message says which one and how to fix it."""
@@ -72,8 +83,14 @@ class SqlRejected(ValueError):
 @dataclass(frozen=True)
 class CheckedSql:
     sql: str
-    # True when the query uses columns about people, so small groups are removed.
-    hides_small_groups: bool = False
+    # Only for queries about people: a query that returns just the number of hidden
+    # groups. The main query returns it too, in HIDDEN_GROUPS_COLUMN, but when every
+    # group is hidden there is no row to carry it.
+    hidden_groups_sql: str | None = None
+
+    @property
+    def hides_small_groups(self) -> bool:
+        return self.hidden_groups_sql is not None
 
 
 def check_sql(
@@ -87,10 +104,31 @@ def check_sql(
     _check_columns(query)
     if brands is not None:
         _check_brand_filters(query, brands)
-    hides_small_groups = _protect_people(query)
+    hidden_groups = _protect_people(query)
+    hidden_groups_sql = None
+    if hidden_groups is not None:
+        hidden_groups_sql = _hidden_groups_query(query, hidden_groups, dataset, brands)
     apply_views(query, dataset, brands)
     _cap_rows(query, max_rows)
-    return CheckedSql(query.sql(dialect="bigquery"), hides_small_groups)
+    return CheckedSql(query.sql(dialect="bigquery"), hidden_groups_sql)
+
+
+def _hidden_groups_query(
+    query: exp.Query, count: exp.Expression, dataset: str, brands: tuple[str, ...] | None
+) -> str:
+    """Add the count of hidden groups to every final SELECT, and return it as its own query.
+
+    Inside the same query the count costs nothing extra: BigQuery bills the columns of a
+    table once per query, even when the query reads the table twice.
+    """
+    for select in _final_select_nodes(query):
+        select.select(exp.alias_(count.copy(), HIDDEN_GROUPS_COLUMN), copy=False)
+    alone = exp.select(exp.alias_(count.copy(), "hidden_groups"))
+    if not isinstance(query, exp.Select) and query.args.get("with_"):
+        # A UNION keeps its WITH clause at the top; the count needs it too.
+        alone.set("with_", query.args["with_"].copy())
+    apply_views(alone, dataset, brands)
+    return alone.sql(dialect="bigquery")
 
 
 def _parse_one(sql: str) -> exp.Expression:
@@ -127,6 +165,8 @@ def _check_columns(query: exp.Query) -> None:
         if not isinstance(star.parent, exp.Count):
             raise SqlRejected("SELECT * is not allowed. List the columns you need.")
     for identifier in query.find_all(exp.Identifier):
+        if identifier.name.lower() == HIDDEN_GROUPS_COLUMN:
+            raise SqlRejected(f"`{identifier.name}` is a reserved name. Use another name.")
         if identifier.name.lower() in DIRECT_PII:
             raise SqlRejected(
                 f"`{identifier.name}` is personal data and cannot be used. "
@@ -170,22 +210,31 @@ def _brand_values(node: exp.Expression) -> list[str]:
     return []
 
 
-def _protect_people(query: exp.Query) -> bool:
-    """Apply rule 5. Returns True when the query uses columns about people."""
+def _protect_people(query: exp.Query) -> exp.Expression | None:
+    """Apply rule 5.
+
+    Returns None when the query does not use columns about people. Otherwise returns an
+    expression that counts the groups the query hides.
+    """
     root = build_scope(query)
     final_selects = _final_selects(root)
-    protected = False
+    counts = []
     for scope in root.traverse():
         if not any(column.name.lower() in PEOPLE_COLUMNS for column in scope.columns):
             continue
         if not any(scope is final for final in final_selects):
             raise SqlRejected(
                 f"Use {_PEOPLE} only in the final SELECT, not in a WITH clause or a "
-                "subquery. Join users or orders in the final SELECT instead."
+                "subquery. Join users or orders in the final SELECT instead. "
+                f"{_TWO_WAYS}"
             )
-        _check_people_select(scope)
-        protected = True
-    return protected
+        counts.append(_check_people_select(scope))
+    if not counts:
+        return None
+    total = counts[0]
+    for count in counts[1:]:
+        total = exp.Add(this=total, expression=count)
+    return total
 
 
 def _final_selects(scope: Scope) -> list[Scope]:
@@ -195,7 +244,19 @@ def _final_selects(scope: Scope) -> list[Scope]:
     return [select for child in scope.set_operation_scopes for select in _final_selects(child)]
 
 
-def _check_people_select(scope: Scope) -> None:
+def _final_select_nodes(query: exp.Query) -> list[exp.Select]:
+    if isinstance(query, exp.Select):
+        return [query]
+    if isinstance(query, exp.Subquery):
+        return _final_select_nodes(query.this)
+    return _final_select_nodes(query.this) + _final_select_nodes(query.expression)
+
+
+def _check_people_select(scope: Scope) -> exp.Expression:
+    """Check a final SELECT that uses columns about people, and remove its small groups.
+
+    Returns a scalar subquery that counts the groups it removes.
+    """
     select = scope.expression
     if not select.args.get("group") and not _only_aggregates(select):
         raise SqlRejected(
@@ -212,9 +273,9 @@ def _check_people_select(scope: Scope) -> None:
     for column in scope.columns:
         if _is_customer_id(column, scope) and not _counted_or_joined(column):
             raise SqlRejected(
-                f"In a query that uses {_PEOPLE}, customer ids may appear only as "
-                "COUNT(DISTINCT ...) or in JOIN ... ON a = b. Do not show, group or "
-                "filter single customers."
+                f"Customer ids cannot be shown, grouped or filtered next to {_PEOPLE}. "
+                f"Here customer ids may appear only as COUNT(DISTINCT ...) or in "
+                f"JOIN ... ON a = b. {_TWO_WAYS}"
             )
     key = _customer_key(scope)
     if key is None:
@@ -222,9 +283,21 @@ def _check_people_select(scope: Scope) -> None:
             f"A query that uses {_PEOPLE} must read users, orders or order_items directly "
             "in its final SELECT, so that groups with few customers can be hidden."
         )
+    customers = exp.Count(this=exp.Distinct(expressions=[key]))
+    size = exp.Literal.number(MIN_GROUP_SIZE)
+
+    # The same SELECT with only the small groups: count its rows. The SELECT's own HAVING,
+    # ORDER BY, LIMIT and QUALIFY are dropped, so every group with fewer customers is
+    # counted, also when the model already filtered them out itself.
+    small_groups = select.copy()
+    for clause in ("having", "order", "limit", "offset", "qualify"):
+        small_groups.set(clause, None)
+    small_groups.having(exp.LT(this=customers.copy(), expression=size.copy()), copy=False)
+    count = exp.select(exp.Count(this=exp.Star())).from_(small_groups.subquery("small_groups"))
+
     # Remove groups with fewer than MIN_GROUP_SIZE customers.
-    count = exp.Count(this=exp.Distinct(expressions=[key]))
-    select.having(exp.GTE(this=count, expression=exp.Literal.number(MIN_GROUP_SIZE)), copy=False)
+    select.having(exp.GTE(this=customers, expression=size), copy=False)
+    return count.subquery()
 
 
 def _own_nodes(select: exp.Select):

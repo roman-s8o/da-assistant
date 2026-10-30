@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     llm_fallback_model: str = "gemini-3.5-flash-lite"
     llm_timeout_s: float = 60.0
     llm_attempts: int = 3
+    # A small, cheap model for the guard that checks every message first.
+    guard_model: str = "gemini-3.5-flash-lite"
 
     # Hard limits for every BigQuery job. BigQuery itself stops a job that goes over them.
     max_bytes_billed: int = 1_000_000_000

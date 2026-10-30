@@ -21,8 +21,16 @@ def turn(queries=(), llm_calls=2):
     )
 
 
-def query(rows=1, error=None):
-    return QueryLog(purpose="p", sql="SELECT 1", rows=rows, bytes=100, error=error)
+def query(rows=1, error=None, hidden_groups=0):
+    return QueryLog(
+        purpose="p",
+        sql="SELECT 1",
+        rows=rows,
+        bytes=100,
+        error=error,
+        hidden_groups=hidden_groups,
+        masked_values=0,
+    )
 
 
 class FakeAgent:
@@ -109,6 +117,25 @@ def test_turn_summary():
     assert cli.turn_summary(result) == (
         "3 queries (2 failed or empty), 6.2 MB scanned · 1 model call, "
         "1,200 tokens in, 80 out · 1.5 s"
+    )
+
+
+def test_turn_summary_shows_privacy_counts():
+    base = turn([query(rows=0, hidden_groups=2)], llm_calls=2)
+    result = TurnResult(**{**base.__dict__, "hidden_groups": 2, "masked_values": 1})
+
+    # A query with every group hidden is not a failed query.
+    assert cli.turn_summary(result) == (
+        "1 query, 6.2 MB scanned · 2 small groups hidden · 1 value masked · "
+        "2 model calls, 1,200 tokens in, 80 out · 1.5 s"
+    )
+
+
+def test_turn_summary_for_a_blocked_message():
+    result = TurnResult("No.", [], 1, 300, 30, 0, 0.7, blocked="injection")
+
+    assert cli.turn_summary(result) == (
+        "blocked by the guard: prompt injection · 1 model call, 300 tokens in, 30 out · 0.7 s"
     )
 
 

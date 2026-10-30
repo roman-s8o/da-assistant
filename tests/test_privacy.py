@@ -10,7 +10,7 @@ import pytest
 import sqlglot
 
 from da_assistant.schema import DIRECT_PII
-from da_assistant.sql_checks import SqlRejected, check_sql
+from da_assistant.sql_checks import HIDDEN_GROUPS_COLUMN, SqlRejected, check_sql
 
 DS = "bigquery-public-data.thelook_ecommerce"
 USERS, ORDERS, ITEMS, PRODUCTS = (
@@ -84,15 +84,33 @@ def db():
     connection.close()
 
 
-def run(db, sql, brands=None):
-    """Check the query for a user with these brands (None: all brands) and run it."""
-    checked = check_sql(sql, dataset=DS, brands=brands, max_rows=1000)
-    duckdb_sql = sqlglot.transpile(checked.sql, read="bigquery", write="duckdb")[0]
-    rows = db.execute(duckdb_sql).fetchall()
+def _execute(db, bigquery_sql):
+    """Run BigQuery SQL in DuckDB. Returns the column names and the rows."""
+    cursor = db.execute(sqlglot.transpile(bigquery_sql, read="bigquery", write="duckdb")[0])
+    names = [column[0] for column in cursor.description]
+    rows = cursor.fetchall()
     for row in rows:
         for value in row:
             assert not any(marker in str(value) for marker in _PII_MARKERS), row
-    return rows
+    return names, rows
+
+
+def run_with_hidden(db, sql, brands=None):
+    """Check and run a query like SqlTool does. Returns the rows and the hidden groups."""
+    checked = check_sql(sql, dataset=DS, brands=brands, max_rows=1000)
+    names, rows = _execute(db, checked.sql)
+    if HIDDEN_GROUPS_COLUMN not in names:
+        assert checked.hidden_groups_sql is None
+        return rows, 0
+    position = names.index(HIDDEN_GROUPS_COLUMN)
+    # When every group is hidden, no row carries the count: ask for it alone.
+    hidden = rows[0][position] if rows else _execute(db, checked.hidden_groups_sql)[1][0][0]
+    return [row[:position] + row[position + 1 :] for row in rows], hidden
+
+
+def run(db, sql, brands=None):
+    """Check the query for a user with these brands (None: all brands) and run it."""
+    return run_with_hidden(db, sql, brands)[0]
 
 
 def rejected(sql, brands=None):
@@ -288,6 +306,43 @@ def test_small_groups_are_counted_within_the_brand_scope(db):
     sql = f"SELECT u.state, COUNT(DISTINCT u.id) FROM {USERS} AS u GROUP BY u.state"
 
     assert run(db, sql, brands=ALICE) == [("California", 6)]
+
+
+@pytest.mark.parametrize(
+    ("sql", "brands", "hidden"),
+    [
+        # Texas, Nevada and Oregon have one customer each.
+        (f"SELECT state, COUNT(*) AS n FROM {USERS} GROUP BY state", None, 3),
+        # ORDER BY and LIMIT do not change how many groups were hidden.
+        (f"SELECT state, COUNT(*) AS n FROM {USERS} GROUP BY state ORDER BY n LIMIT 1", None, 3),
+        # Every group is hidden: the count comes from its own query.
+        (f"SELECT COUNT(*) FROM {USERS} WHERE state = 'Texas'", None, 1),
+        (f"SELECT state, COUNT(*) FROM {USERS} WHERE state = 'Atlantis' GROUP BY state", None, 0),
+        # For Alice, only Nevada (user 8) is small.
+        (f"SELECT u.state, COUNT(*) FROM {USERS} AS u GROUP BY u.state", ALICE, 1),
+        # A UNION adds up the hidden groups of its branches: 3 states and 3 cities.
+        (
+            f"SELECT state AS v, COUNT(*) AS n FROM {USERS} GROUP BY state "
+            f"UNION ALL SELECT city AS v, COUNT(*) AS n FROM {USERS} GROUP BY city",
+            None,
+            6,
+        ),
+        (f"SELECT COUNT(*) FROM {USERS}", None, 0),
+        # The model filtered small groups out itself: they are still counted.
+        (
+            f"SELECT state, COUNT(DISTINCT id) AS n FROM {USERS} GROUP BY state "
+            "HAVING COUNT(DISTINCT id) >= 5",
+            None,
+            3,
+        ),
+    ],
+)
+def test_the_number_of_hidden_groups_is_reported(db, sql, brands, hidden):
+    assert run_with_hidden(db, sql, brands)[1] == hidden
+
+
+def test_the_hidden_groups_column_name_is_reserved():
+    assert "reserved" in rejected(f"SELECT 1 AS _hidden_groups FROM {USERS}")
 
 
 def test_queries_with_people_columns_say_that_small_groups_are_hidden():

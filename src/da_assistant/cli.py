@@ -175,18 +175,36 @@ def _answer(agent: Agent, question: str, thread_id: str) -> None:
     console.print(f"[dim]{escape(turn_summary(result))}[/]\n")
 
 
+_BLOCKED = {
+    "off_topic": "blocked by the guard: off topic",
+    "injection": "blocked by the guard: prompt injection",
+    "leak": "answer replaced: it quoted the instructions",
+}
+
+
 def turn_summary(result: TurnResult) -> str:
-    """One line with the cost of the turn, shown under the answer."""
-    failed = sum(1 for query in result.queries if query["error"] or query["rows"] == 0)
-    queries = _count(len(result.queries), "query", "queries")
-    if failed:
-        queries += f" ({failed} failed or empty)"
-    return (
-        f"{queries}, {format_bytes(result.bytes_scanned)} scanned · "
+    """One line with what the turn did and cost, shown under the answer."""
+    parts = [_BLOCKED[result.blocked]] if result.blocked else []
+    if result.queries or not result.blocked:
+        failed = sum(
+            1
+            for query in result.queries
+            if query["error"] or (query["rows"] == 0 and not query["hidden_groups"])
+        )
+        queries = _count(len(result.queries), "query", "queries")
+        if failed:
+            queries += f" ({failed} failed or empty)"
+        parts.append(f"{queries}, {format_bytes(result.bytes_scanned)} scanned")
+    if result.hidden_groups:
+        parts.append(_count(result.hidden_groups, "small group hidden", "small groups hidden"))
+    if result.masked_values:
+        parts.append(_count(result.masked_values, "value masked", "values masked"))
+    parts.append(
         f"{_count(result.llm_calls, 'model call', 'model calls')}, "
-        f"{result.input_tokens:,} tokens in, {result.output_tokens:,} out · "
-        f"{result.seconds:.1f} s"
+        f"{result.input_tokens:,} tokens in, {result.output_tokens:,} out"
     )
+    parts.append(f"{result.seconds:.1f} s")
+    return " · ".join(parts)
 
 
 def _count(number: int, one: str, many: str) -> str:

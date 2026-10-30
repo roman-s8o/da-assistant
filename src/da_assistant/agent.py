@@ -1,14 +1,20 @@
-"""The agent: a LangGraph loop of the model and the `run_sql` tool.
+"""The agent: a LangGraph loop of the model and the `run_sql` tool, with checks around it.
 
 One turn (one question and its answer):
 
-    START -> agent -> tools -> agent -> tools -> ... -> agent -> END
+    START -> guard -> agent -> tools -> agent -> ... -> agent -> final_check -> END
+               \\-> END (the guard blocked the message)
 
-The model decides which queries to run, so it can answer questions that need
-several steps. Every query goes through `SqlTool`, which checks, dry runs and runs
-it. A failed or empty query goes back to the model with the reason, so the model
-can fix it. Each turn has a budget: model calls, failed queries and bytes scanned.
-When the budget is used up, the model must answer without tools.
+- guard: is this an analysis question, or off-topic, or a prompt injection?
+- agent: the model decides which queries to run, so it can answer questions that need
+  several steps.
+- tools: every query goes through `SqlTool`, which checks, dry runs and runs it. A failed
+  or empty query goes back to the model with the reason, so the model can fix it.
+- final_check: masks anything that looks like personal data, replaces an answer that
+  quotes the instructions, and adds how many small groups were hidden.
+
+Each turn has a budget: model calls, failed queries and bytes scanned. When the budget
+is used up, the model must answer without tools.
 """
 
 import time
@@ -26,10 +32,12 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 
 from da_assistant.config import Settings, UserProfile
+from da_assistant.guard import Guard
 from da_assistant.llm import chat_model
-from da_assistant.prompts import system_prompt
+from da_assistant.privacy import mask_text
+from da_assistant.prompts import guard_answer, system_prompt
 from da_assistant.schema import column_types, schema_text
-from da_assistant.sql_tool import SqlTool
+from da_assistant.sql_tool import SqlTool, hidden_groups_summary
 from da_assistant.warehouse import Warehouse
 
 TOOL_NAME = "run_sql"
@@ -58,6 +66,8 @@ class QueryLog(TypedDict):
     rows: int
     bytes: int
     error: str | None
+    hidden_groups: int
+    masked_values: int
 
 
 class AgentState(TypedDict):
@@ -69,6 +79,11 @@ class AgentState(TypedDict):
     failed_queries: int
     bytes_scanned: int
     queries: list[QueryLog]
+    # Values masked by the final check (the query results count their own).
+    masked_values: int
+    # Why the turn was stopped: "off_topic", "injection" (the guard) or "leak" (the answer
+    # quoted the instructions). None for a normal turn.
+    blocked: str | None
 
 
 @dataclass(frozen=True)
@@ -89,6 +104,9 @@ class TurnResult:
     output_tokens: int
     bytes_scanned: int
     seconds: float
+    blocked: str | None = None
+    hidden_groups: int = 0
+    masked_values: int = 0
 
 
 class Agent:
@@ -96,6 +114,7 @@ class Agent:
         self,
         *,
         model: BaseChatModel,
+        guard: Guard,
         sql_tool: SqlTool,
         user: UserProfile,
         schema: str,
@@ -106,6 +125,7 @@ class Agent:
     ) -> None:
         self.model = model
         self.model_with_tools = model.bind_tools([RunSql])
+        self.guard = guard
         self.sql_tool = sql_tool
         self.user = user
         self.schema = schema
@@ -119,6 +139,7 @@ class Agent:
         warehouse = Warehouse.from_settings(settings)
         return cls(
             model=chat_model(settings),
+            guard=Guard(chat_model(settings, settings.guard_model)),
             sql_tool=SqlTool(
                 warehouse, brands=user.brand_scope, max_result_rows=settings.max_result_rows
             ),
@@ -150,6 +171,8 @@ class Agent:
             "failed_queries": 0,
             "bytes_scanned": 0,
             "queries": [],
+            "masked_values": 0,
+            "blocked": None,
         }
         for update in self.graph.stream(turn, config, stream_mode="updates"):
             if on_progress:
@@ -157,24 +180,52 @@ class Agent:
 
         state = self.graph.get_state(config).values
         last = state["messages"][-1]
+        queries = state["queries"]
         return TurnResult(
             answer=str(last.text).strip() if isinstance(last, AIMessage) else "",
-            queries=state["queries"],
+            queries=queries,
             llm_calls=state["llm_calls"],
             input_tokens=state["input_tokens"],
             output_tokens=state["output_tokens"],
             bytes_scanned=state["bytes_scanned"],
             seconds=time.perf_counter() - start,
+            blocked=state["blocked"],
+            # The most groups one result hid. Results over the same groups hide the same ones.
+            hidden_groups=max((query["hidden_groups"] for query in queries), default=0),
+            masked_values=state["masked_values"] + sum(q["masked_values"] for q in queries),
         )
 
     def _build_graph(self, checkpointer: BaseCheckpointSaver):
         graph = StateGraph(AgentState)
+        graph.add_node("guard", self._guard_node)
         graph.add_node("agent", self._agent_node)
         graph.add_node("tools", self._tools_node)
-        graph.add_edge(START, "agent")
-        graph.add_conditional_edges("agent", _next_step, ["tools", END])
+        graph.add_node("final_check", self._final_check_node)
+        graph.add_edge(START, "guard")
+        graph.add_conditional_edges("guard", _after_guard, ["agent", END])
+        graph.add_conditional_edges("agent", _after_agent, ["tools", "final_check"])
         graph.add_edge("tools", "agent")
+        graph.add_edge("final_check", END)
         return graph.compile(checkpointer=checkpointer)
+
+    def _guard_node(self, state: AgentState) -> dict[str, Any]:
+        messages = state["messages"]
+        answers = [m for m in messages[:-1] if isinstance(m, AIMessage) and not m.tool_calls]
+        result = self.guard.check(
+            str(messages[-1].content),
+            scope=self.user.scope_text(),
+            last_answer=str(answers[-1].text) if answers else "",
+        )
+        update: dict[str, Any] = {
+            "llm_calls": state["llm_calls"] + result.llm_calls,
+            "input_tokens": state["input_tokens"] + result.input_tokens,
+            "output_tokens": state["output_tokens"] + result.output_tokens,
+        }
+        if result.blocked:
+            # A fixed reply: nothing in the message can change what the user gets back.
+            update["messages"] = [AIMessage(result.reply)]
+            update["blocked"] = result.category
+        return update
 
     def _can_query(self, state: AgentState) -> bool:
         return (
@@ -222,6 +273,8 @@ class Agent:
                         rows=result.row_count,
                         bytes=result.bytes_scanned,
                         error=result.error,
+                        hidden_groups=result.hidden_groups,
+                        masked_values=result.masked_values,
                     )
                 )
             else:
@@ -236,6 +289,21 @@ class Agent:
             "bytes_scanned": scanned,
             "queries": queries,
         }
+
+    def _final_check_node(self, state: AgentState) -> dict[str, Any]:
+        last = state["messages"][-1]
+        answer, masked = mask_text(str(last.text))
+        answer, leaked = guard_answer(answer)
+        hidden = [query["hidden_groups"] for query in state["queries"] if query["hidden_groups"]]
+        if hidden and not leaked:
+            answer += f"\n\n*Privacy note: {hidden_groups_summary(hidden)}*"
+        update: dict[str, Any] = {"masked_values": state["masked_values"] + masked}
+        if leaked:
+            update["blocked"] = "leak"
+        if answer != str(last.text):
+            # Same id: the checked answer replaces the model's answer in the history too.
+            update["messages"] = [AIMessage(answer, id=last.id)]
+        return update
 
 
 def conversation_view(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -256,9 +324,13 @@ def conversation_view(messages: list[AnyMessage]) -> list[AnyMessage]:
     return earlier + messages[turn_start:]
 
 
-def _next_step(state: AgentState) -> str:
+def _after_guard(state: AgentState) -> str:
+    return END if state["blocked"] else "agent"
+
+
+def _after_agent(state: AgentState) -> str:
     last = state["messages"][-1]
-    return "tools" if isinstance(last, AIMessage) and last.tool_calls else END
+    return "tools" if isinstance(last, AIMessage) and last.tool_calls else "final_check"
 
 
 def _report_progress(update: dict[str, Any], on_progress: Callable[[str], None]) -> None:

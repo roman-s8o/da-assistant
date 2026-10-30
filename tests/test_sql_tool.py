@@ -2,12 +2,13 @@ import pandas as pd
 import pytest
 from google.api_core import exceptions as gcp_errors
 
+from da_assistant.privacy import MASK
 from da_assistant.sql_tool import (
     EMPTY_RESULT_HINT,
-    SMALL_GROUPS_NOTE,
     QueryResult,
     SqlTool,
     format_bytes,
+    hidden_groups_note,
 )
 
 DS = "bigquery-public-data.thelook_ecommerce"
@@ -19,7 +20,9 @@ class FakeWarehouse:
 
     def __init__(self, *, estimate=100, rows=None, dry_run_error=None, run_error=None):
         self.estimate = estimate
-        self.rows = pd.DataFrame({"brand": ["A", "B"]}) if rows is None else rows
+        # One result, or a list of results for the runs in order.
+        rows = pd.DataFrame({"brand": ["A", "B"]}) if rows is None else rows
+        self.results = rows if isinstance(rows, list) else [rows]
         self.dry_run_error = dry_run_error
         self.run_error = run_error
         self.calls = []
@@ -34,7 +37,7 @@ class FakeWarehouse:
         self.calls.append(("run", sql))
         if self.run_error:
             raise self.run_error
-        return self.rows
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
 
 def run(warehouse, sql=GOOD_SQL, bytes_left=10_000):
@@ -121,15 +124,71 @@ def test_for_model_shows_csv_and_says_when_rows_are_cut():
     ]
 
 
-def test_people_queries_tell_the_model_that_small_groups_are_hidden():
-    sql = f"SELECT state, COUNT(*) AS n FROM `{DS}.users` GROUP BY state"
-    warehouse = FakeWarehouse(rows=pd.DataFrame({"state": ["California"], "n": [6]}))
+PEOPLE_SQL = f"SELECT state, COUNT(*) AS n FROM `{DS}.users` GROUP BY state"
 
-    result = run(warehouse, sql=sql)
+
+def test_hidden_groups_come_back_with_the_rows():
+    rows = pd.DataFrame({"state": ["California"], "n": [6], "_hidden_groups": [3]})
+    warehouse = FakeWarehouse(rows=rows)
+
+    result = run(warehouse, sql=PEOPLE_SQL)
 
     assert result.hides_small_groups
-    assert SMALL_GROUPS_NOTE in result.for_model(50).splitlines()[0]
+    assert result.hidden_groups == 3
+    assert list(result.rows.columns) == ["state", "n"]
+    assert [name for name, _ in warehouse.calls] == ["dry_run", "run"]
     assert "HAVING COUNT(DISTINCT" in warehouse.calls[0][1]
+    first_line = result.for_model(50).splitlines()[0]
+    assert (
+        first_line == "1 rows. 3 groups with fewer than 5 customers were hidden to protect privacy."
+    )
+
+
+def test_when_every_group_is_hidden_the_count_is_asked_alone():
+    empty = pd.DataFrame({"state": [], "n": [], "_hidden_groups": []})
+    warehouse = FakeWarehouse(rows=[empty, pd.DataFrame({"hidden_groups": [4]})])
+
+    result = run(warehouse, sql=PEOPLE_SQL)
+
+    assert result.hidden_groups == 4
+    assert result.row_count == 0
+    # An answer, not a failure: retrying cannot change it.
+    assert result.useful
+    assert [name for name, _ in warehouse.calls] == ["dry_run", "run", "dry_run", "run"]
+    assert result.bytes_scanned == 200
+    assert "every group has fewer than 5 customers" in result.for_model(50)
+
+
+def test_no_groups_at_all_is_an_empty_result():
+    empty = pd.DataFrame({"state": [], "n": [], "_hidden_groups": []})
+    warehouse = FakeWarehouse(rows=[empty, pd.DataFrame({"hidden_groups": [0]})])
+
+    result = run(warehouse, sql=PEOPLE_SQL)
+
+    assert not result.useful
+    assert result.for_model(50) == f"{EMPTY_RESULT_HINT} {hidden_groups_note(0)}"
+
+
+@pytest.mark.parametrize(
+    ("count", "text"),
+    [
+        (0, "No group had fewer than 5 customers, so nothing was hidden."),
+        (1, "1 group with fewer than 5 customers was hidden to protect privacy."),
+        (2, "2 groups with fewer than 5 customers were hidden to protect privacy."),
+    ],
+)
+def test_hidden_groups_note(count, text):
+    assert hidden_groups_note(count) == text
+
+
+def test_personal_data_in_a_result_is_masked_before_the_model_sees_it():
+    rows = pd.DataFrame({"brand": ["A", "write to jane@example.com"], "n": [1, 2]})
+
+    result = run(FakeWarehouse(rows=rows))
+
+    assert result.masked_values == 1
+    assert result.rows["brand"].tolist() == ["A", f"write to {MASK}"]
+    assert "1 values looked like personal data" in result.for_model(50)
 
 
 def test_brand_scope_is_applied():
