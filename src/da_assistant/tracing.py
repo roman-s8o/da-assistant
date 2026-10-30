@@ -4,8 +4,8 @@ Each step of a turn (guard, model call, tool call, confirmation, final check) is
 "span" line; the end of the turn is one "turn" line with its totals.
 
 What a trace keeps: ids, names, counts, sizes, timings, tokens, bytes, error codes, and
-the SQL with anything that looks like personal data masked. What it never keeps: the
-text of questions, answers and reports. A question or an answer is stored as a
+the SQL as the model wrote it, with anything that looks like personal data masked. What it
+never keeps: the text of questions, answers and reports. A question or an answer is stored as a
 fingerprint, a short SHA-256 and the length. It shows that two turns had the same
 answer, or checks a text someone shows you, but it does not hold the text. So a deleted
 report cannot live on in the traces, and the traces need no deletion of their own.

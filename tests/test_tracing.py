@@ -7,7 +7,7 @@ from fakes import FakeModel, FakeSqlTool, answer, failed, make_agent, ok, query_
 
 from da_assistant.reports import ReportStore
 from da_assistant.resilience import CallInfo
-from da_assistant.sql_tool import QueryResult
+from da_assistant.sql_tool import QueryResult, SqlTool
 from da_assistant.tracing import Tracer, fingerprint, read_turns
 
 QUESTION = "Which plan did we agree for the Zephyr-7731 launch?"
@@ -50,10 +50,9 @@ def test_traces_hold_no_question_answer_or_report_text(tmp_path):
 
 def test_sql_and_errors_in_traces_are_masked(tmp_path):
     tracer, path = trace_file(tmp_path)
-    sql_result = QueryResult(
-        "SELECT 1 WHERE note = 'jane@example.com'", error="Query rejected: jane@example.com"
-    )
-    model = FakeModel(query_call(), answer("x"))
+    sql = "SELECT 1 WHERE note = 'jane@example.com'"
+    sql_result = QueryResult(sql, error="Query rejected: jane@example.com")
+    model = FakeModel(query_call(sql=sql), answer("x"))
 
     make_agent(model, FakeSqlTool(sql_result), tracer=tracer).ask("q", thread_id="t")
 
@@ -61,6 +60,8 @@ def test_sql_and_errors_in_traces_are_masked(tmp_path):
     assert "jane@example.com" not in path.read_text()
     assert tool["sql"] == "SELECT 1 WHERE note = '[hidden]'"
     assert tool["rejected"] is True
+    # Nothing ran, so there is no checked SQL.
+    assert tool["checked_sql"] is None
 
 
 def test_each_step_is_a_span_and_the_turn_has_totals(tmp_path):
@@ -171,3 +172,57 @@ def test_empty_results_and_hidden_groups(tmp_path):
 
     turn = read_turns(path)[0]
     assert (turn["empty_results"], turn["hidden_groups"], turn["self_corrected"]) == (1, 4, True)
+
+
+DS = "bigquery-public-data.thelook_ecommerce"
+FOUR_TABLES = f"""
+SELECT p.category, u.state, COUNT(DISTINCT o.order_id) AS orders, SUM(oi.sale_price) AS revenue
+FROM `{DS}.order_items` AS oi
+JOIN `{DS}.orders` AS o ON o.order_id = oi.order_id
+JOIN `{DS}.products` AS p ON p.id = oi.product_id
+JOIN `{DS}.users` AS u ON u.id = oi.user_id
+WHERE oi.status NOT IN ('Cancelled', 'Returned') AND u.country = 'United States'
+GROUP BY p.category, u.state
+ORDER BY revenue DESC
+"""
+
+
+class FakeWarehouse:
+    dataset = DS
+
+    def __init__(self):
+        self.ran = []
+
+    def dry_run(self, sql):
+        return 1000
+
+    def run(self, sql):
+        self.ran.append(sql)
+        return pd.DataFrame({"category": ["Jeans"], "state": ["Texas"], "_hidden_groups": [3]})
+
+
+def test_traces_keep_the_models_sql_of_a_four_table_join(tmp_path):
+    tracer, path = trace_file(tmp_path)
+    warehouse = FakeWarehouse()
+    sql_tool = SqlTool(warehouse, brands=("Calvin Klein", "Diesel"), max_result_rows=1000)
+    model = FakeModel(query_call(sql=FOUR_TABLES), answer("x"))
+
+    agent = make_agent(model, sql_tool, tracer=tracer)
+    agent.user = agent.user.model_copy(
+        update={"brands": ("Calvin Klein", "Diesel"), "all_brands": False}
+    )
+    agent.ask("Revenue by category and state", thread_id="t")
+
+    ran = warehouse.ran[0]
+    # The SQL that ran starts with the safe views and the hidden groups count, so a cut at
+    # 2000 characters loses the end of the model's query.
+    assert len(ran) > 2000
+    assert "ORDER BY revenue DESC" in ran and "ORDER BY revenue DESC" not in ran[:2000]
+    tool = next(r for r in records(path) if r.get("span") == "tool")
+    assert tool["sql"] == FOUR_TABLES
+    assert tool["sql_chars"] == len(FOUR_TABLES)
+    for part in ("WHERE oi.status", "u.country = 'United States'", "GROUP BY p.category, u.state"):
+        assert part in tool["sql"]
+    assert tool["checked_sql"] == fingerprint(ran)
+    # The brand scope is in the turn record, so the rewrite can be done again.
+    assert read_turns(path)[0]["brands"] == ["Calvin Klein", "Diesel"]

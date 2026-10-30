@@ -88,9 +88,12 @@ We chose this over "text with a short retention, deleted together with the repor
   characters of its SHA-256 and its length. It shows repeated questions, and it checks a text
   that a user shows you, but it does not hold the text. A short question can be guessed by
   hashing candidates; in production the fingerprint is an HMAC with a secret key.
-- **What stays as text:** the SQL and the short purpose the model gives each query, both with
-  the personal data patterns masked. Neither is answer or report text. String values in the
-  SQL (for example `'Brasil'`) stay, because they explain empty results.
+- **What stays as text:** the SQL as the model wrote it and the short purpose it gives each
+  query, both with the personal data patterns masked. Neither is answer or report text. String
+  values in the SQL (for example `'Brasil'`) stay, because they explain empty results. The SQL
+  that ran is not stored: it starts with the safe views, so a cut would lose the model's own
+  WHERE and GROUP BY. It follows from the model's SQL and the user's brand scope, which the
+  turn record keeps, and its fingerprint shows which rewrite ran.
 - **The trade-off:** a trace does not show the exact wording. In a live session, `/trace`
   shows the steps and the user sees the conversation. In production, a per-incident debug
   capture, with the user's consent and a short retention, would add the text when needed.

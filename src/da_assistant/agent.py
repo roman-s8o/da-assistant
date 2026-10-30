@@ -73,7 +73,10 @@ EARLIER_MESSAGES = 20
 
 class QueryLog(TypedDict):
     purpose: str
+    # The SQL as the model wrote it.
     sql: str
+    # The SQL that went to BigQuery, after the checks and the safe views. None if rejected.
+    checked_sql: str | None
     rows: int
     bytes: int
     error: str | None
@@ -312,6 +315,8 @@ class Agent:
         record = turn_record(
             turn, state, status=status, max_sql_retries=self.budget.max_sql_retries
         )
+        # With the model's SQL, the brand scope is all it takes to redo the rewrite.
+        record["brands"] = list(self.user.brand_scope) if self.user.brand_scope else "all"
         if error is not None:
             record["error"] = safe_text(type(error).__name__ + ": " + str(error))
         self.last_trace = turn
@@ -430,14 +435,22 @@ class Agent:
 
     def _run_sql(self, args: dict[str, Any], update: dict[str, Any], span: dict[str, Any]) -> str:
         bytes_left = self.budget.max_bytes - update["bytes_scanned"]
-        result = self.sql_tool.run(str(args.get("sql", "")), bytes_left=bytes_left)
+        model_sql = str(args.get("sql", ""))
+        result = self.sql_tool.run(model_sql, bytes_left=bytes_left)
+        rejected = bool(result.error and result.error.startswith("Query rejected"))
+        checked_sql = None if rejected else result.sql
         span.update(
             purpose=safe_text(str(args.get("purpose", ""))),
-            sql=safe_text(result.sql, MAX_SQL_CHARS),
+            # The model's own SQL: short, and it shows its WHERE and GROUP BY. The SQL that
+            # ran starts with the safe views, so a cut would lose them. It follows from this
+            # SQL and the user's brand scope (in the turn record); its fingerprint is kept.
+            sql=safe_text(model_sql, MAX_SQL_CHARS),
+            sql_chars=len(model_sql),
+            checked_sql=fingerprint(checked_sql) if checked_sql else None,
             rows=result.row_count,
             bytes=result.bytes_scanned,
             error=safe_text(result.error) if result.error else None,
-            rejected=bool(result.error and result.error.startswith("Query rejected")),
+            rejected=rejected,
             hidden_groups=result.hidden_groups,
             masked_values=result.masked_values,
         )
@@ -446,7 +459,8 @@ class Agent:
         update["queries"].append(
             QueryLog(
                 purpose=str(args.get("purpose", "")),
-                sql=result.sql,
+                sql=model_sql,
+                checked_sql=checked_sql,
                 rows=result.row_count,
                 bytes=result.bytes_scanned,
                 error=result.error,

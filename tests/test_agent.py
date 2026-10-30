@@ -36,7 +36,8 @@ def test_answers_with_one_query():
     assert result.queries == [
         {
             "purpose": "count orders",
-            "sql": "SELECT 1 LIMIT 1000",
+            "sql": "SELECT 1",
+            "checked_sql": "SELECT 1 LIMIT 1000",
             "rows": 1,
             "bytes": 1000,
             "error": None,
