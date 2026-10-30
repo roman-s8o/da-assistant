@@ -23,8 +23,10 @@ def test_shipped_questions_are_valid(questions_file, users_file):
     assert len({q.id for q in questions}) == len(questions)
     for question in questions:
         assert question.user in users
-        # The reference SQL must be a read-only query over the allowed tables.
-        check_sql(question.sql, dataset=DS, brands=users[question.user].brand_scope, max_rows=1000)
+        if question.sql is not None:
+            # The reference SQL must be a read-only query over the allowed tables.
+            scope = users[question.user].brand_scope
+            check_sql(question.sql, dataset=DS, brands=scope, max_rows=1000)
 
 
 def test_diesel_case_is_in_the_set(questions_file):
@@ -80,6 +82,25 @@ def test_wilson_interval():
     assert high == 1.0
     assert 0.2 < low < 0.21
     assert wilson_interval(0, 0) == (0.0, 1.0)
+
+
+def test_small_groups_case_checks_behavior_not_a_number(questions_file):
+    case = next(q for q in load_questions(questions_file) if q.id == "small-groups-stop-early")
+
+    assert case.sql is None
+    assert (case.max_model_calls, case.max_all_hidden_results) == (6, 2)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"sql": "SELECT 1"},  # a number needs sql, expected and as_of together
+        {},  # a case needs something to check
+    ],
+)
+def test_invalid_cases(fields):
+    with pytest.raises(ValueError):
+        EvalQuestion(id="x", user="ceo", question="q", **fields)
 
 
 def test_bad_eval_file(tmp_path):
@@ -149,6 +170,65 @@ def test_run_eval_uses_a_new_conversation_for_each_question():
     run(agent, questions=(QUESTION, QUESTION))
 
     assert len(set(agent.threads)) == 2
+
+
+BEHAVIOR = EvalQuestion(
+    id="b1",
+    user="ceo",
+    question="Revenue by state and category?",
+    max_model_calls=4,
+    max_all_hidden_results=2,
+    answer_mentions_any=("by quarter", "state only"),
+)
+
+
+class FakeTrace:
+    def __init__(self, **record):
+        self.record = record
+
+
+class TracedAgent(FakeAgent):
+    def __init__(self, answer, llm_calls, **record):
+        super().__init__(answer)
+        self.llm_calls = llm_calls
+        self.last_trace = FakeTrace(**record)
+
+    def ask(self, question, *, thread_id):
+        self.threads.append(thread_id)
+        return TurnResult(self.answer, [], self.llm_calls, 10, 5, 0, 0.1)
+
+
+def checks_of(agent):
+    outcome = run(agent, questions=(BEHAVIOR,)).pop()
+    return outcome, {check.name: check.passed for check in outcome.checks}
+
+
+def test_behavior_checks_pass():
+    agent = TracedAgent(
+        "Too few customers. Try by quarter.",
+        4,
+        all_hidden_results=2,
+        models=["lite"],
+        fallback=True,
+    )
+
+    outcome, checks = checks_of(agent)
+
+    assert checks == {"model calls": True, "fully hidden results": True, "mentions": True}
+    assert outcome.passed
+    assert outcome.model == "lite (fallback)"
+
+
+def test_behavior_checks_fail_with_a_reason():
+    agent = TracedAgent("No data.", 8, all_hidden_results=5, models=["big"])
+
+    outcome, checks = checks_of(agent)
+
+    assert checks == {"model calls": False, "fully hidden results": False, "mentions": False}
+    assert not outcome.passed
+    details = {check.name: check.detail for check in outcome.checks}
+    assert details["model calls"] == "8, at most 4"
+    assert outcome.model == "big"
 
 
 def test_run_eval_error_fails_only_that_question():

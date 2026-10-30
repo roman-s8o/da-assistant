@@ -1,20 +1,26 @@
-"""A small eval: ask the agent questions with known answers and score the answers.
+"""A small eval: ask the agent questions and check what it does.
 
-Each question has reference SQL written by hand. The eval runs it to get the expected
-value, asks the agent in a new conversation, and passes the question when a number in
-the answer is within the tolerance of the expected value.
+A case can check a number and the agent's behavior:
+- A known number: reference SQL written by hand. The eval runs it to get the expected value
+  and passes the check when a number in the answer is within the tolerance.
+- Behavior: at most N model calls, at most N results with every group hidden, words the
+  answer must mention.
+
+Each case runs in a new conversation. The report shows which model answered each case,
+because the primary model can fall back to another one.
 """
 
 import math
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from da_assistant.agent import Agent, TurnResult
 from da_assistant.config import ConfigError, UserProfile
@@ -28,10 +34,40 @@ class EvalQuestion(BaseModel):
     id: str
     user: str
     question: str
-    sql: str
-    expected: float
-    as_of: date
-    tolerance: float
+    # What the case is about, for the report: for example "time", "products", "privacy".
+    category: str = ""
+    # A known number: the reference SQL gives it; `expected` is its value on `as_of`.
+    sql: str | None = None
+    expected: float | None = None
+    as_of: date | None = None
+    tolerance: float = 0.0
+    # Checks on the agent's behavior.
+    max_model_calls: int | None = None
+    max_all_hidden_results: int | None = None
+    answer_mentions_any: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _check_case(self) -> Self:
+        number_fields = (self.sql, self.expected, self.as_of)
+        if any(f is not None for f in number_fields) and None in number_fields:
+            raise ValueError("a known number needs sql, expected and as_of together")
+        if self.sql is None and not self._behavior_checks():
+            raise ValueError("a case needs a known number or at least one behavior check")
+        return self
+
+    def _behavior_checks(self) -> bool:
+        return (
+            self.max_model_calls is not None
+            or self.max_all_hidden_results is not None
+            or bool(self.answer_mentions_any)
+        )
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    passed: bool
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -39,23 +75,74 @@ class EvalOutcome:
     question: EvalQuestion
     reference: float | None = None
     turn: TurnResult | None = None
+    # The turn record of the trace: models, fallback, hidden groups.
+    record: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
 
     @property
+    def checks(self) -> list[Check]:
+        if self.error is not None or self.turn is None:
+            return [Check("ran", False, self.error or "no answer")]
+        q, turn = self.question, self.turn
+        checks = []
+        if q.sql is not None and self.reference is not None:
+            checks.append(
+                Check(
+                    "number",
+                    answer_matches(turn.answer, self.reference, q.tolerance),
+                    f"expected {self.reference:,.2f}",
+                )
+            )
+        if q.max_model_calls is not None:
+            checks.append(
+                Check(
+                    "model calls",
+                    turn.llm_calls <= q.max_model_calls,
+                    f"{turn.llm_calls}, at most {q.max_model_calls}",
+                )
+            )
+        if q.max_all_hidden_results is not None:
+            count = self.record.get("all_hidden_results", 0)
+            checks.append(
+                Check(
+                    "fully hidden results",
+                    count <= q.max_all_hidden_results,
+                    f"{count}, at most {q.max_all_hidden_results}",
+                )
+            )
+        if q.answer_mentions_any:
+            text = turn.answer.casefold()
+            found = [word for word in q.answer_mentions_any if word.casefold() in text]
+            checks.append(
+                Check(
+                    "mentions",
+                    bool(found),
+                    f"found {', '.join(found)}"
+                    if found
+                    else "none of: " + ", ".join(q.answer_mentions_any),
+                )
+            )
+        return checks
+
+    @property
     def passed(self) -> bool:
-        return (
-            self.error is None
-            and self.reference is not None
-            and self.turn is not None
-            and answer_matches(self.turn.answer, self.reference, self.question.tolerance)
-        )
+        checks = self.checks
+        return bool(checks) and all(check.passed for check in checks)
+
+    @property
+    def model(self) -> str:
+        """The model that answered, and whether it was the fallback model."""
+        models = ", ".join(self.record.get("models", [])) or "?"
+        return models + (" (fallback)" if self.record.get("fallback") else "")
 
     @property
     def reference_changed(self) -> bool:
         """The data changed since the expected value was written down."""
+        q = self.question
         return (
             self.reference is not None
-            and abs(self.reference - self.question.expected) > self.question.tolerance
+            and q.expected is not None
+            and abs(self.reference - q.expected) > q.tolerance
         )
 
 
@@ -105,18 +192,23 @@ def run_eval(
     make_agent: Callable[[UserProfile], Agent],
     on_question: Callable[[EvalQuestion], None] | None = None,
 ) -> list[EvalOutcome]:
-    """Run every question. An error fails that question only."""
+    """Run every case. An error fails that case only."""
     agents: dict[str, Agent] = {}
     outcomes = []
     for question in questions:
         if on_question:
             on_question(question)
         try:
-            reference = float(warehouse.run(question.sql).iloc[0, 0])
+            reference = None
+            if question.sql is not None:
+                reference = float(warehouse.run(question.sql).iloc[0, 0])
             if question.user not in agents:
                 agents[question.user] = make_agent(users[question.user])
-            turn = agents[question.user].ask(question.question, thread_id=uuid.uuid4().hex)
-            outcomes.append(EvalOutcome(question, reference=reference, turn=turn))
-        except Exception as exc:  # one broken question must not stop the eval
+            agent = agents[question.user]
+            turn = agent.ask(question.question, thread_id=uuid.uuid4().hex)
+            trace = getattr(agent, "last_trace", None)
+            record = trace.record if trace is not None else {}
+            outcomes.append(EvalOutcome(question, reference=reference, turn=turn, record=record))
+        except Exception as exc:  # one broken case must not stop the eval
             outcomes.append(EvalOutcome(question, error=explain(exc)))
     return outcomes

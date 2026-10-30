@@ -141,7 +141,7 @@ def eval_command(
             on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
         )
 
-    table = Table("", "Question", "Expected", "Answer", show_lines=True)
+    table = Table("", "Case", "Model", "Checks", "Answer", show_lines=True)
     for outcome in outcomes:
         status_text = "[green]PASS[/]" if outcome.passed else "[red]FAIL[/]"
         table.add_row(status_text, escape(outcome.question.id), *_eval_cells(outcome))
@@ -151,19 +151,19 @@ def eval_command(
         raise typer.Exit(1)
 
 
-def _eval_cells(outcome: EvalOutcome) -> tuple[str, str]:
+def _eval_cells(outcome: EvalOutcome) -> tuple[str, str, str]:
+    lines = [
+        f"{'ok' if check.passed else 'FAIL'} {check.name}: {check.detail}"
+        for check in outcome.checks
+    ]
     question = outcome.question
-    if outcome.reference is None:
-        expected = "?"
-    else:
-        expected = f"{outcome.reference:,.2f}"
-        if outcome.reference_changed:
-            expected += f"\n(was {question.expected:,.2f} on {question.as_of})"
+    if outcome.reference_changed:
+        lines.append(f"(the data changed: was {question.expected:,.2f} on {question.as_of})")
     if outcome.error:
         answer = f"ERROR: {outcome.error}"
     else:
         answer = outcome.turn.answer[:300] + "\n" + turn_summary(outcome.turn)
-    return escape(expected), escape(answer)
+    return escape(outcome.model), escape("\n".join(lines)), escape(answer)
 
 
 def eval_summary(outcomes: list[EvalOutcome]) -> str:

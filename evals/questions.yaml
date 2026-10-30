@@ -62,3 +62,17 @@ questions:
     expected: 61582
     as_of: 2026-10-30
     tolerance: 0
+
+  - id: small-groups-stop-early
+    user: alice
+    category: privacy
+    question: >-
+      What were revenue and orders by product category for US customers in each state
+      in September 2026?
+    # For a brand manager with a small volume, almost every state and category group has
+    # fewer than 5 customers, so it is hidden. On 2026-10-30 the agent spent its whole
+    # budget (8 model calls) on ever coarser groupings. Now it may try one coarser
+    # grouping, then it must answer with what can be shown and suggest a coarser cut.
+    max_model_calls: 6
+    max_all_hidden_results: 2
+    answer_mentions_any: [quarter, state only, by state, country, coarser, broader, all states]
