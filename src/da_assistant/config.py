@@ -48,10 +48,19 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-3.8-flash"
     llm_fallback_model: str = "gemini-3.5-flash-lite"
     llm_timeout_s: float = 60.0
+    llm_attempts: int = 3
 
     # Hard limits for every BigQuery job. BigQuery itself stops a job that goes over them.
     max_bytes_billed: int = 1_000_000_000
     bq_timeout_s: float = 60.0
+
+    # Limits for one chat turn (one question and its answer).
+    max_llm_calls_per_turn: int = 8
+    max_sql_retries: int = 2
+    max_bytes_per_turn: int = 5_000_000_000
+    # Rows kept from a query result, and rows of it shown to the model.
+    max_result_rows: int = 1000
+    rows_for_model: int = 50
 
     users_file: Path = Path("config/users.yaml")
 

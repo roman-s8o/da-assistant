@@ -1,58 +1,24 @@
-"""Gemini access through the google-genai SDK."""
+"""Gemini chat models through LangChain (langchain-google-genai)."""
 
-import time
-from dataclasses import dataclass
-
-from google import genai
-from google.genai import types
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from da_assistant.config import ConfigError, Settings
 
 
-@dataclass(frozen=True)
-class LLMReply:
-    text: str
-    model: str
-    input_tokens: int
-    # Includes thinking tokens: they are billed as output.
-    output_tokens: int
-    latency_s: float
-
-
-class Gemini:
-    def __init__(self, client: genai.Client, *, model: str, fallback_model: str) -> None:
-        self.client = client
-        self.model = model
-        self.fallback_model = fallback_model
-
-    @classmethod
-    def from_settings(cls, settings: Settings) -> "Gemini":
-        if settings.gemini_api_key is None:
-            raise ConfigError(
-                "GEMINI_API_KEY is not set. Get a free key at https://aistudio.google.com/apikey "
-                "and put it in the .env file."
-            )
-        client = genai.Client(
-            api_key=settings.gemini_api_key.get_secret_value(),
-            http_options=types.HttpOptions(timeout=int(settings.llm_timeout_s * 1000)),
+def chat_model(settings: Settings, model: str | None = None) -> ChatGoogleGenerativeAI:
+    """The chat model for the agent. `model` overrides the model from the settings."""
+    if settings.gemini_api_key is None:
+        raise ConfigError(
+            "GEMINI_API_KEY is not set. Get a free key at https://aistudio.google.com/apikey "
+            "and put it in the .env file."
         )
-        return cls(client, model=settings.llm_model, fallback_model=settings.llm_fallback_model)
-
-    def generate(
-        self, prompt: str, *, system: str | None = None, model: str | None = None
-    ) -> LLMReply:
-        model = model or self.model
-        start = time.perf_counter()
-        response = self.client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(system_instruction=system),
-        )
-        usage = response.usage_metadata or types.GenerateContentResponseUsageMetadata()
-        return LLMReply(
-            text=response.text or "",
-            model=model,
-            input_tokens=usage.prompt_token_count or 0,
-            output_tokens=(usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0),
-            latency_s=time.perf_counter() - start,
-        )
+    return ChatGoogleGenerativeAI(
+        model=model or settings.llm_model,
+        google_api_key=settings.gemini_api_key.get_secret_value(),
+        timeout=settings.llm_timeout_s,
+        # The total number of attempts. The google-genai SDK retries
+        # rate limit (429) and server (5xx) errors with exponential backoff.
+        max_retries=settings.llm_attempts,
+        # None keeps the default temperature of the model.
+        temperature=None,
+    )

@@ -1,21 +1,17 @@
 """Setup checks for `da-assistant check`: the users file, BigQuery and Gemini."""
 
-import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from google.api_core import exceptions as gcp_errors
-from google.auth import exceptions as auth_errors
-from google.genai import errors as genai_errors
+from google import genai
+from langchain_core.language_models import BaseChatModel
 
 from da_assistant.config import ConfigError, Settings, load_users
-from da_assistant.llm import Gemini
+from da_assistant.errors import explain
+from da_assistant.llm import chat_model
+from da_assistant.schema import TABLES
 from da_assistant.warehouse import Warehouse
-
-TABLES = ("orders", "order_items", "products", "users")
-
-# Google API errors start with the HTTP method and URL, which only add noise for the user.
-_REQUEST_PREFIX = re.compile(r"(GET|POST|PUT|PATCH|DELETE) \S+: ")
 
 
 @dataclass(frozen=True)
@@ -32,15 +28,16 @@ def run_checks(settings: Settings) -> list[CheckResult]:
         _attempt("BigQuery", lambda: check_bigquery(Warehouse.from_settings(settings))),
     ]
     try:
-        llm = Gemini.from_settings(settings)
+        model = chat_model(settings)
     except ConfigError as exc:
         return [*results, CheckResult("Gemini", False, str(exc))]
+    fallback = settings.llm_fallback_model
     return [
         *results,
-        _attempt(f"Gemini {llm.model}", lambda: check_reply(llm)),
+        _attempt(f"Gemini {settings.llm_model}", lambda: check_reply(model)),
         _attempt(
-            f"Gemini {llm.fallback_model} (fallback)",
-            lambda: check_model_exists(llm, llm.fallback_model),
+            f"Gemini {fallback} (fallback)",
+            lambda: check_model_exists(model.client, fallback),
         ),
     ]
 
@@ -66,16 +63,19 @@ def check_bigquery(warehouse: Warehouse) -> str:
     return f"project {warehouse.project}, dry run {scanned:,} bytes. Rows: {counts}"
 
 
-def check_reply(llm: Gemini) -> str:
-    reply = llm.generate("Reply with the single word OK.")
+def check_reply(model: BaseChatModel) -> str:
+    start = time.perf_counter()
+    reply = model.invoke("Reply with the single word OK.")
+    seconds = time.perf_counter() - start
+    usage = reply.usage_metadata or {}
     return (
-        f'replied "{reply.text.strip()}" in {reply.latency_s:.1f} s '
-        f"({reply.input_tokens} tokens in, {reply.output_tokens} out)"
+        f'replied "{reply.text.strip()}" in {seconds:.1f} s '
+        f"({usage.get('input_tokens', 0)} tokens in, {usage.get('output_tokens', 0)} out)"
     )
 
 
-def check_model_exists(llm: Gemini, model: str) -> str:
-    llm.client.models.get(model=model)
+def check_model_exists(client: genai.Client, model: str) -> str:
+    client.models.get(model=model)
     return "available"
 
 
@@ -84,47 +84,3 @@ def _attempt(name: str, check: Callable[[], str]) -> CheckResult:
         return CheckResult(name, True, check())
     except Exception as exc:  # a check reports any error instead of crashing
         return CheckResult(name, False, explain(exc))
-
-
-def explain(exc: Exception) -> str:
-    """A short error message with a hint on how to fix it, when we know one."""
-    if isinstance(exc, ConfigError):
-        return str(exc)
-    message = _short_message(exc)
-    hint = _hint(exc)
-    return f"{message}\nHint: {hint}" if hint else message
-
-
-def _short_message(exc: Exception) -> str:
-    if isinstance(exc, genai_errors.APIError) and exc.message:
-        text = f"{exc.code} {exc.status}: {exc.message}"
-    else:
-        text = _REQUEST_PREFIX.sub("", str(exc))
-    lines = text.strip().splitlines()
-    return lines[0][:300] if lines else type(exc).__name__
-
-
-def _hint(exc: Exception) -> str | None:
-    if isinstance(exc, auth_errors.GoogleAuthError):
-        return "run `gcloud auth application-default login`."
-    text = str(exc)
-    if "has not enabled BigQuery" in text or "BigQuery API has not been used" in text:
-        return (
-            "enable the BigQuery API in this project, "
-            "or set DA_GCP_PROJECT to a project where it is enabled."
-        )
-    if isinstance(exc, gcp_errors.Forbidden):
-        return (
-            "check that the BigQuery API is enabled in the billing project "
-            "and that your account can run jobs there."
-        )
-    if isinstance(exc, genai_errors.APIError):
-        if exc.code in (401, 403) or (exc.code == 400 and "API key" in text):
-            return "check GEMINI_API_KEY."
-        if exc.code == 404:
-            return "model not found. Set DA_LLM_MODEL or DA_LLM_FALLBACK_MODEL."
-        if exc.code == 429:
-            return "rate limit or quota reached. Wait a minute and try again."
-        if exc.code >= 500:
-            return "Gemini service error. Try again later."
-    return None

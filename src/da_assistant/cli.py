@@ -1,16 +1,21 @@
 """Command line interface: `da-assistant check` and `da-assistant chat`."""
 
 import logging
+import uuid
 from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markdown import Markdown
 from rich.markup import escape
 from rich.table import Table
 
+from da_assistant.agent import Agent, TurnResult
 from da_assistant.config import ConfigError, Settings, UserProfile, load_settings, load_users
+from da_assistant.errors import explain
 from da_assistant.health import run_checks
+from da_assistant.sql_tool import format_bytes
 
 app = typer.Typer(
     help="Data analysis chat assistant for the thelook_ecommerce dataset.",
@@ -61,8 +66,15 @@ def chat(
     """Start a chat session."""
     settings = _settings()
     profile = _user(settings, user)
+    try:
+        with console.status("Connecting to BigQuery and Gemini..."):
+            agent = Agent.from_settings(settings, profile)
+    except Exception as exc:  # setup errors end the session with a clear message
+        _fail(explain(exc))
+    thread_id = uuid.uuid4().hex
+
     console.print(f"Hi {escape(profile.name)}. You can analyze: {escape(profile.scope_text())}.")
-    console.print("Type /help for commands.\n")
+    console.print("Ask about sales, customers or products. Type /help for commands.\n")
 
     while True:
         try:
@@ -76,8 +88,43 @@ def chat(
         if text == "/help":
             console.print(CHAT_HELP)
             continue
-        console.print("[dim]The agent is not connected yet.[/]")
+        _answer(agent, text, thread_id)
     console.print("\nBye.")
+
+
+def _answer(agent: Agent, question: str, thread_id: str) -> None:
+    """Answer one question. Any error is shown, and the session goes on."""
+    try:
+        with console.status("Thinking...") as status:
+            result = agent.ask(
+                question, thread_id=thread_id, on_progress=lambda text: status.update(escape(text))
+            )
+    except KeyboardInterrupt:
+        console.print("[yellow]Stopped.[/]\n")
+        return
+    except Exception as exc:  # the chat must never crash on one bad turn
+        console.print(f"[red]Sorry, I could not answer this.[/] {escape(explain(exc))}\n")
+        return
+    console.print(Markdown(result.answer or "I could not produce an answer. Please rephrase."))
+    console.print(f"[dim]{escape(turn_summary(result))}[/]\n")
+
+
+def turn_summary(result: TurnResult) -> str:
+    """One line with the cost of the turn, shown under the answer."""
+    failed = sum(1 for query in result.queries if query["error"] or query["rows"] == 0)
+    queries = _count(len(result.queries), "query", "queries")
+    if failed:
+        queries += f" ({failed} failed or empty)"
+    return (
+        f"{queries}, {format_bytes(result.bytes_scanned)} scanned · "
+        f"{_count(result.llm_calls, 'model call', 'model calls')}, "
+        f"{result.input_tokens:,} tokens in, {result.output_tokens:,} out · "
+        f"{result.seconds:.1f} s"
+    )
+
+
+def _count(number: int, one: str, many: str) -> str:
+    return f"{number} {one if number == 1 else many}"
 
 
 def _settings() -> Settings:
