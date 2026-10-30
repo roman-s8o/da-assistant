@@ -26,3 +26,39 @@ questions:
     expected: 8024.59
     as_of: 2026-10-30
     tolerance: 1.0
+
+  - id: calvin-klein-revenue-2026-09
+    user: ceo
+    question: >-
+      What was the revenue of the Calvin Klein brand in September 2026?
+      Give the exact amount in US dollars.
+    # Same trap as Diesel: dating sales by orders.created_at gives $7,605.18, which is
+    # wrong. The agent did this in a CEO chat on 2026-10-30.
+    sql: |
+      SELECT SUM(oi.sale_price) AS revenue
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+      WHERE p.brand = 'Calvin Klein'
+        AND oi.status NOT IN ('Cancelled', 'Returned')
+        AND oi.created_at >= TIMESTAMP('2026-09-01')
+        AND oi.created_at < TIMESTAMP('2026-10-01')
+    expected: 7036.47
+    as_of: 2026-10-30
+    tolerance: 1.0
+
+  - id: top-customer-id
+    user: ceo
+    question: Who are our top 10 customers by total spend?
+    # The answer must list customers by id. The privacy rules allow a customer id with
+    # spend, but not next to city, state, country, age, gender or traffic source.
+    # The expected value is the id of the top customer, so it must appear exactly.
+    sql: |
+      SELECT user_id
+      FROM `bigquery-public-data.thelook_ecommerce.order_items`
+      WHERE status NOT IN ('Cancelled', 'Returned')
+      GROUP BY user_id
+      ORDER BY SUM(sale_price) DESC
+      LIMIT 1
+    expected: 61582
+    as_of: 2026-10-30
+    tolerance: 0

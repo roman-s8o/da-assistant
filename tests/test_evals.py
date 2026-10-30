@@ -38,6 +38,24 @@ def test_diesel_case_is_in_the_set(questions_file):
     assert not answer_matches("Diesel made $8,011.", diesel.expected, diesel.tolerance)
 
 
+def test_calvin_klein_case_is_in_the_set(questions_file):
+    case = next(q for q in load_questions(questions_file) if q.id == "calvin-klein-revenue-2026-09")
+
+    assert "oi.created_at" in case.sql
+    assert answer_matches("Calvin Klein made $7,036.47.", case.expected, case.tolerance)
+    assert answer_matches("About $7,036 in September.", case.expected, case.tolerance)
+    # The wrong definition (sales dated by orders.created_at) must fail.
+    assert not answer_matches("Calvin Klein made $7,605.", case.expected, case.tolerance)
+
+
+def test_top_customer_case_needs_the_exact_id(questions_file):
+    case = next(q for q in load_questions(questions_file) if q.id == "top-customer-id")
+
+    assert answer_matches("| 1 | 61582 | $1,748 |", case.expected, case.tolerance)
+    assert answer_matches("Customer 61,582 spent the most.", case.expected, case.tolerance)
+    assert not answer_matches("The top customer spent $1,748.", case.expected, case.tolerance)
+
+
 @pytest.mark.parametrize(
     ("text", "numbers"),
     [
