@@ -11,7 +11,8 @@ Deleting is a two-step action:
    never deleted by surprise. Deletion is final: there is no undo (client requirement).
 
 The audit log keeps only metadata: who, when, what, how many and which ids. Never the
-titles or the text of the reports.
+titles or the text of the reports. SQLite runs with `secure_delete`, so the text of a
+deleted report does not stay behind in the database file.
 """
 
 import json
@@ -108,6 +109,9 @@ class ReportStore:
         # A short connection per operation: simple and safe across threads.
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
+        # Overwrite deleted content with zeros. Without it, the text of a deleted report
+        # stays in the free pages of the file until SQLite reuses them.
+        db.execute("PRAGMA secure_delete = ON")
         try:
             with db:
                 yield db

@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -145,3 +146,39 @@ def test_the_database_lives_where_the_settings_say(tmp_path, clock):
 @pytest.mark.parametrize(("count", "word"), [(1, "yes"), (3, "yes"), (4, "4"), (12, "12")])
 def test_confirmation_word(count, word):
     assert confirmation_word(count, count_above=3) == word
+
+
+def _database_bytes(path) -> bytes:
+    """The database file and any journal next to it."""
+    return b"".join(f.read_bytes() for f in path.parent.glob(path.name + "*"))
+
+
+def test_deleted_text_is_gone_from_the_database_file(tmp_path, clock):
+    path = tmp_path / "reports.db"
+    store = ReportStore(path, now=clock)
+    secret = "Diesel plan XJ-4471: cut the price of the 1955 jacket by 30 percent. " * 20
+    keep = save(store, "Other report", content="Nothing special.")
+    gone = save(store, "Diesel plan", content=secret)
+    assert b"XJ-4471" in _database_bytes(path)
+
+    pending = store.request_delete(author="alice", reports=[gone])
+    store.resolve_delete(author="alice", action_id=pending.action_id, confirmed=True)
+
+    assert b"XJ-4471" not in _database_bytes(path)
+    assert b"Diesel plan" not in _database_bytes(path)
+    assert store.get(author="alice", report_id=keep.id) is not None
+
+
+def test_without_secure_delete_the_text_would_stay(tmp_path):
+    # The control case: shows that the test above checks something real.
+    path = tmp_path / "plain.db"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA secure_delete = OFF")
+    db.execute("CREATE TABLE t (content TEXT)")
+    db.execute("INSERT INTO t VALUES (?)", ("XJ-4471 " * 100,))
+    db.commit()
+    db.execute("DELETE FROM t")
+    db.commit()
+    db.close()
+
+    assert b"XJ-4471" in path.read_bytes()
