@@ -49,6 +49,18 @@ uv run da-assistant chat --user alice
 
 The users and the brands each of them can analyze are in `config/users.yaml`.
 
+## Models
+
+The assistant uses `gemini-3.5-flash-lite` and switches to `gemini-3.8-flash` when it fails.
+The eval numbers were measured on Flash-Lite, and the free Gemini tier gives only 20 requests
+a day on Flash (and 500 on Flash-Lite), so a few questions would use Flash up.
+To use other models, set them in `.env`:
+
+```bash
+DA_LLM_MODEL=gemini-3.8-flash
+DA_LLM_FALLBACK_MODEL=gemini-3.5-flash-lite
+```
+
 ## Tests
 
 ```bash

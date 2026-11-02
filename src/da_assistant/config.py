@@ -45,8 +45,10 @@ class Settings(BaseSettings):
     )
     dataset: str = "bigquery-public-data.thelook_ecommerce"
 
-    llm_model: str = "gemini-3.8-flash"
-    llm_fallback_model: str = "gemini-3.5-flash-lite"
+    # The eval numbers were measured on Flash-Lite. The free tier allows 500 requests a day
+    # for it and only 20 for Flash (checked on 2026-11-02), so Flash is the fallback.
+    llm_model: str = "gemini-3.5-flash-lite"
+    llm_fallback_model: str = "gemini-3.8-flash"
     # Per attempt. A normal answer takes a few seconds; an overloaded model can take a minute
     # to return an error.
     llm_timeout_s: float = 30.0

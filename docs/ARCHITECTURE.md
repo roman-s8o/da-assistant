@@ -27,12 +27,13 @@ What this means for the design:
   backoff and jitter. 400, 401 and 403 are not retried: the user gets a clear message at once.
   404 (model not found) is not retried either, but the fallback model takes over.
 - **Fall back to a different tier.** After the retries, the agent switches to the fallback model.
-  The fallback must be a different tier (Flash-Lite), because the other Flash version was down too.
+  The fallback must be a different tier: when Flash was down, the other Flash version was down
+  too, and Flash-Lite answered.
 - **Remember the failure.** After repeated failures, the primary model is skipped for a few minutes
   (a simple circuit breaker), so every new turn does not wait for the same timeouts again.
 - **Switch models without code changes.** The model is a setting (`DA_LLM_MODEL`). During this outage
-  we kept developing on `gemini-3.5-flash-lite` by changing `.env` only. The default in code stays
-  the newest Flash model.
+  we kept developing on `gemini-3.5-flash-lite` by changing `.env` only. Since 2026-11-02 Flash-Lite
+  is the default and Flash the fallback (see "Model quotas" below).
 - **Detect it fast.** The setup check showed in seconds which part failed and why,
   with the error code, the message and a hint.
 
@@ -83,6 +84,23 @@ The last row is the setting the agent had before: three SDK attempts made the us
 minutes for one error. Now the SDK makes one attempt, our own retry layer decides what happens
 next, and every attempt shows in the traces. With the 30-second timeout, a slow failure costs
 at most 30 seconds before the fallback model answers.
+
+### Model quotas: a prototype limit, not a design limit
+
+The prototype runs on the free Gemini API tier. Its quotas are per Google Cloud project and per
+model, and the daily ones reset at midnight Pacific time. On 2026-11-02 they were 500 requests
+a day for `gemini-3.5-flash-lite` and 20 for `gemini-3.8-flash`. One full eval run (48 cases)
+takes about 130 requests, and one chat question 1 to 8. That is why Flash-Lite is the default
+model, the one the eval numbers come from, and Flash is the fallback.
+
+In production, Gemini runs on Vertex AI with a paid quota: billed per token, without a free
+daily cap, and with Provisioned Throughput when the load needs reserved capacity. So the daily
+limit belongs to the prototype, not to the design. What the prototype still does about it:
+
+- A 429 that says a daily quota is used up is not retried: waiting does not help, so the
+  fallback model, which has its own quota, answers at once. The traces label it `429 per day`.
+- The eval stops at the first such error and writes no results, with the time the quota resets.
+  Cases after it would fail or run on another model, so the numbers would not be comparable.
 
 ## Where data lives
 
