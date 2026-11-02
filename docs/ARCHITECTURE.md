@@ -128,8 +128,8 @@ The agent core does not import the CLI. The CLI is one client of `Agent.ask` and
 **Models:**
 - Gemini Flash-Lite answers, and Gemini Flash is the fallback. The eval numbers come from
   Flash-Lite. The guard uses Flash-Lite too.
-- The fallback is a different tier on purpose. In an outage on 2026-10-30, two Flash versions
-  failed at once, and Flash-Lite answered.
+- The fallback is a different tier on purpose. In an outage during development, two Flash
+  versions failed at once, and Flash-Lite answered.
 - Production picks the primary model by running the eval on each candidate.
 
 **LangGraph:**
@@ -138,7 +138,8 @@ The agent core does not import the CLI. The CLI is one client of `Agent.ask` and
 - `interrupt()` pauses the graph before a delete. Only the app can resume it.
 - A checkpointer saves the state of each conversation.
 - We would also consider Google ADK, which fits Vertex AI well. We chose LangGraph for its
-  explicit control flow and its pauses. The README states our experience with it.
+  explicit control flow and its pauses. I have used LangGraph in production since 2024, on my
+  last three client projects.
 
 **sqlglot:** each query is parsed into a syntax tree. The rules run on the tree, not on the
 text, so formatting tricks do not get past them. The same tree is rewritten to the safe views.
@@ -221,9 +222,9 @@ flowchart LR
 
 *Built in the prototype. Production adds the cloud controls.*
 
-**The client's rules** (2026-10-30): never show names, email, street address, postal code or
-coordinates, and never send them to the model. City, state, country, age, gender and traffic
-source are allowed only in aggregates. Each manager analyzes only their own brands.
+**The client's rules**, from their answers in Slack: never show names, email, street address,
+postal code or coordinates, and never send them to the model. City, state, country, age, gender
+and traffic source are allowed only in aggregates. Each manager analyzes only their own brands.
 
 **Our additions:** a customer id may be shown, but never next to the columns about people. An
 aggregate is a group of at least 5 customers. Revenue counts only the user's own order items,
@@ -341,7 +342,7 @@ the prompt, and the case then passed in 4 of 4 tries.
 - If every group of a result is hidden, the model gets one coarser retry, then must answer.
 - Measured: [EVAL 11-03: model calls, cost and p95 latency per question].
 
-**What we saw.** On 2026-10-30, Gemini Flash returned 503 and 504 errors again and again. The
+**What we saw.** During development, Gemini Flash returned 503 and 504 errors again and again. The
 previous Flash version failed too. Flash-Lite answered in 0.7 seconds. One failed attempt took
 21 to 58 seconds. With the SDK's own three retries, one error took 3 minutes.
 
