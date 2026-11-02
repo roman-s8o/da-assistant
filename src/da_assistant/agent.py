@@ -714,11 +714,12 @@ def turn_record(
         for s in model_spans
     ) + sum(query_cost(q["bytes"]) for q in queries if not q["error"])
     agent_spans = [s for s in turn.spans if s["span"] == "agent"]
+    guard = next((s for s in turn.spans if s["span"] == "guard"), {})
     return {
         "status": status,
-        "question": next(
-            (s["question"] for s in turn.spans if s["span"] == "guard"), fingerprint("")
-        ),
+        "question": guard.get("question", fingerprint("")),
+        # Which guard layer decided: "rules", "model", or "rules only" when the model failed.
+        "guard_source": guard.get("source"),
         "answer": fingerprint(answer),
         "answered": status == "ok" and not blocked and not refusal and not gave_up and bool(answer),
         "blocked": blocked,

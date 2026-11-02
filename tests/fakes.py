@@ -73,15 +73,16 @@ class FakeGuard:
 
     model_name = "gemini-3.5-flash-lite"
 
-    def __init__(self, category="analysis", llm_calls=0):
+    def __init__(self, category="analysis", llm_calls=0, source="model"):
         self.category = category
         self.llm_calls = llm_calls
+        self.source = source
         self.calls = []  # (message, scope, last_answer)
 
     def check(self, message, *, scope, last_answer=""):
         self.calls.append((message, scope, last_answer))
         return GuardResult(
-            self.category, "test", "model", self.llm_calls, 7 * self.llm_calls, self.llm_calls
+            self.category, "test", self.source, self.llm_calls, 7 * self.llm_calls, self.llm_calls
         )
 
 

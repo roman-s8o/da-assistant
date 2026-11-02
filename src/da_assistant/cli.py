@@ -1,9 +1,10 @@
 """Command line interface: `da-assistant check`, `chat` and `eval`."""
 
 import logging
+import tempfile
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -17,7 +18,14 @@ from rich.table import Table
 from da_assistant.agent import Agent, Confirmation, TurnResult
 from da_assistant.config import ConfigError, Settings, UserProfile, load_settings, load_users
 from da_assistant.errors import explain
-from da_assistant.evals import EvalOutcome, load_questions, run_eval, wilson_interval
+from da_assistant.evals import (
+    EvalOutcome,
+    check_lines,
+    group_results,
+    load_questions,
+    markdown_report,
+    run_eval,
+)
 from da_assistant.health import run_checks
 from da_assistant.metrics import summarize
 from da_assistant.sql_tool import format_bytes
@@ -30,6 +38,9 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+# The eval cases: analysis questions and the red team.
+EVAL_FILES = [Path("evals/questions.yaml"), Path("evals/red_team.yaml")]
 
 CHAT_HELP = """Commands:
   /help      show this help
@@ -113,65 +124,103 @@ def chat(
 
 @app.command("eval")
 def eval_command(
-    file: Annotated[Path, typer.Option(help="The question set.")] = Path("evals/questions.yaml"),
-    only: Annotated[str | None, typer.Option(help="Run only the question with this id.")] = None,
+    file: Annotated[
+        list[Path] | None,
+        typer.Option(help="A file of eval cases. Repeat for more. Default: both files in evals/."),
+    ] = None,
+    only: Annotated[
+        list[str] | None, typer.Option(help="Run only the case with this id. Repeat for more.")
+    ] = None,
+    category: Annotated[
+        list[str] | None,
+        typer.Option(help="Run only the cases of this category. Repeat for more."),
+    ] = None,
+    report: Annotated[
+        Path | None, typer.Option(help="Also write the results as markdown to this file.")
+    ] = None,
+    pause: Annotated[
+        float, typer.Option(help="Seconds to wait between cases, for a key with a low rate limit.")
+    ] = 0.0,
 ) -> None:
-    """Ask the agent the eval questions and score the answers. Uses BigQuery and Gemini."""
+    """Ask the agent the eval cases and check the answers. Uses BigQuery and Gemini.
+
+    Reports that the agent saves go to a temporary database, so the eval never changes
+    the users' saved reports. Traces go to eval_traces.jsonl, next to the chat traces.
+    """
     settings = _settings()
     users = _users(settings)
-    try:
-        questions = load_questions(file)
-    except ConfigError as exc:
-        _fail(str(exc))
+    questions = []
+    for path in file or EVAL_FILES:
+        try:
+            questions += load_questions(path)
+        except ConfigError as exc:
+            _fail(str(exc))
     if only:
-        questions = [question for question in questions if question.id == only]
-        if not questions:
-            _fail(f"No question with id '{only}' in {file}.")
-    try:
-        warehouse = Warehouse.from_settings(settings)
-    except Exception as exc:  # setup errors end the run with a clear message
-        _fail(explain(exc))
+        questions = [question for question in questions if question.id in only]
+    if category:
+        questions = [question for question in questions if question.category in category]
+    if not questions:
+        _fail("No eval case matches --only and --category.")
+    unknown = sorted({question.user for question in questions} - set(users))
+    if unknown:
+        _fail(f"Unknown users in the eval cases: {', '.join(unknown)}.")
 
-    with console.status("Running the eval...") as status:
-        outcomes = run_eval(
-            questions,
-            users=users,
-            warehouse=warehouse,
-            make_agent=lambda user: Agent.from_settings(settings, user),
-            on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
+    with tempfile.TemporaryDirectory() as tmp:
+        eval_settings = settings.model_copy(
+            update={
+                "db_path": Path(tmp) / "eval.db",
+                "trace_path": settings.trace_path.with_name("eval_traces.jsonl"),
+            }
         )
+        try:
+            warehouse = Warehouse.from_settings(eval_settings)
+        except Exception as exc:  # setup errors end the run with a clear message
+            _fail(explain(exc))
+        with console.status("Running the eval...") as status:
+            outcomes = run_eval(
+                questions,
+                users=users,
+                warehouse=warehouse,
+                make_agent=lambda user: Agent.from_settings(eval_settings, user),
+                on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
+                pause_s=pause,
+            )
 
     table = Table("", "Case", "Model", "Checks", "Answer", show_lines=True)
     for outcome in outcomes:
         status_text = "[green]PASS[/]" if outcome.passed else "[red]FAIL[/]"
         table.add_row(status_text, escape(outcome.question.id), *_eval_cells(outcome))
     console.print(table)
-    console.print(eval_summary(outcomes))
+    _show_groups(outcomes)
+    _show_metrics([outcome.record for outcome in outcomes if outcome.record], "Eval metrics")
+    if report:
+        models = (
+            f"Models: {settings.llm_model} is the primary model, {settings.llm_fallback_model} "
+            f"the fallback, {settings.guard_model} the guard."
+        )
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            markdown_report(outcomes, run_on=date.today(), models=models), encoding="utf-8"
+        )
+        console.print(f"Results written to {escape(str(report))}.")
     if not all(outcome.passed for outcome in outcomes):
         raise typer.Exit(1)
 
 
 def _eval_cells(outcome: EvalOutcome) -> tuple[str, str, str]:
-    lines = [
-        f"{'ok' if check.passed else 'FAIL'} {check.name}: {check.detail}"
-        for check in outcome.checks
-    ]
-    question = outcome.question
-    if outcome.reference_changed:
-        lines.append(f"(the data changed: was {question.expected:,.2f} on {question.as_of})")
     if outcome.error:
         answer = f"ERROR: {outcome.error}"
     else:
         answer = outcome.turn.answer[:300] + "\n" + turn_summary(outcome.turn)
-    return escape(outcome.model), escape("\n".join(lines)), escape(answer)
+    return escape(outcome.model), escape("\n".join(check_lines(outcome))), escape(answer)
 
 
-def eval_summary(outcomes: list[EvalOutcome]) -> str:
-    passed = sum(outcome.passed for outcome in outcomes)
-    total = len(outcomes)
-    low, high = wilson_interval(passed, total)
-    rate = passed / total if total else 0.0
-    return f"{passed} of {total} passed ({rate:.0%}; 95% interval {low:.0%} to {high:.0%})."
+def _show_groups(outcomes: list[EvalOutcome]) -> None:
+    table = Table("Suite or category", "Passed", "95% interval", "Stopped by")
+    for row in group_results(outcomes):
+        name = f"[bold]{escape(row.name)}[/]" if row.is_suite else "  " + escape(row.name)
+        table.add_row(name, row.pass_text, row.interval_text, escape(row.stopped_text))
+    console.print(table)
 
 
 @app.command()

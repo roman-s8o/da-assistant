@@ -3,7 +3,17 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from fakes import FakeModel, FakeSqlTool, answer, failed, make_agent, ok, query_call, tool_call
+from fakes import (
+    FakeGuard,
+    FakeModel,
+    FakeSqlTool,
+    answer,
+    failed,
+    make_agent,
+    ok,
+    query_call,
+    tool_call,
+)
 
 from da_assistant.reports import ReportStore
 from da_assistant.resilience import CallInfo
@@ -226,3 +236,13 @@ def test_traces_keep_the_models_sql_of_a_four_table_join(tmp_path):
     assert tool["checked_sql"] == fingerprint(ran)
     # The brand scope is in the turn record, so the rewrite can be done again.
     assert read_turns(path)[0]["brands"] == ["Calvin Klein", "Diesel"]
+
+
+def test_the_turn_shows_when_the_guard_model_failed(tmp_path):
+    tracer, _ = trace_file(tmp_path)
+    guard = FakeGuard(source="rules only")
+
+    agent = make_agent(FakeModel(answer("x")), FakeSqlTool(), guard=guard, tracer=tracer)
+    agent.ask("q", thread_id="t")
+
+    assert agent.last_trace.record["guard_source"] == "rules only"

@@ -4,7 +4,7 @@ from google.auth import exceptions as auth_errors
 from google.genai import errors as genai_errors
 
 from da_assistant.config import ConfigError
-from da_assistant.errors import explain
+from da_assistant.errors import explain, is_rate_limit
 
 
 def genai_error(code: int, message: str, status: str = "") -> genai_errors.APIError:
@@ -61,3 +61,14 @@ def test_explain_finds_the_api_error_inside_a_wrapper():
 
 def test_explain_config_error_is_shown_as_is():
     assert explain(ConfigError("line 1\nline 2")) == "line 1\nline 2"
+
+
+def test_is_rate_limit():
+    wrapped = RuntimeError("LangChain wrapper")
+    wrapped.__cause__ = genai_error(429, "Resource exhausted")
+
+    assert is_rate_limit(genai_error(429, "Resource exhausted"))
+    assert is_rate_limit(wrapped)
+    assert is_rate_limit(gcp_errors.TooManyRequests("Quota exceeded"))
+    assert not is_rate_limit(genai_error(503, "The model is busy."))
+    assert not is_rate_limit(RuntimeError("other"))

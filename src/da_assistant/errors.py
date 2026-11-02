@@ -24,6 +24,14 @@ def explain(exc: BaseException) -> str:
     return f"{message}\nHint: {hint}" if hint else message
 
 
+def is_rate_limit(exc: BaseException) -> bool:
+    """The API refused the call because of a rate limit or a quota (HTTP 429)."""
+    exc = _api_cause(exc)
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code == 429
+    return isinstance(exc, gcp_errors.TooManyRequests)
+
+
 def short_message(exc: BaseException, max_chars: int = 300) -> str:
     if isinstance(exc, genai_errors.APIError) and exc.message:
         text = f"{exc.code} {exc.status}: {exc.message}"

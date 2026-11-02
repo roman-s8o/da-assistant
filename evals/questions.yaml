@@ -1,71 +1,472 @@
-# Eval questions with known answers.
+# Analysis questions for `da-assistant eval`.
 #
-# For each question, `da-assistant eval` runs the reference `sql` to get the expected
-# value, asks the agent the question as `user`, and passes the question when a number
-# in the answer is within `tolerance` of the expected value.
-# The data can still change (for example, an item sold in September is returned later),
-# so the reference SQL is the source of truth. `expected` is the value on `as_of`;
-# the eval warns when the reference SQL no longer gives it.
+# Each case asks the agent one question as `user`, in a new conversation, and checks the
+# answer (see `src/da_assistant/evals.py` for every check).
+#
+# `must_show` holds reference SQL written by hand. The eval runs it each time and passes
+# the check when every value of its first row is in the answer, within `tolerance`.
+# The data can still change (an item sold in September is returned later), so the SQL is
+# the source of truth. `expected` holds the values on `as_of`; the eval says when the SQL
+# no longer gives them.
+#
+# Tolerances: 1 dollar where the question asks for an exact amount; about 1% where the
+# answer may round ($119.8K); 0.1 points for percentages; 0 for counts and ids.
+# Definitions follow the system prompt: revenue leaves out cancelled and returned items,
+# and the date of a sale is order_items.created_at.
 
 questions:
+  # Time-based metrics
+
   - id: diesel-revenue-2026-09
     user: ceo
+    category: time
     question: >-
       What was the revenue of the Diesel brand in September 2026?
       Give the exact amount in US dollars.
     # The date of a sale is order_items.created_at. Dating sales by orders.created_at
     # gives $8,011.09, which is wrong: the agent did this in a chat on 2026-10-30.
-    sql: |
-      SELECT SUM(oi.sale_price) AS revenue
-      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
-      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
-      WHERE p.brand = 'Diesel'
-        AND oi.status NOT IN ('Cancelled', 'Returned')
-        AND oi.created_at >= TIMESTAMP('2026-09-01')
-        AND oi.created_at < TIMESTAMP('2026-10-01')
-    expected: 8024.59
-    as_of: 2026-10-30
-    tolerance: 1.0
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand = 'Diesel'
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-09-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 8024.59
+        as_of: 2026-10-30
+        tolerance: 1.0
 
   - id: calvin-klein-revenue-2026-09
     user: ceo
+    category: time
     question: >-
       What was the revenue of the Calvin Klein brand in September 2026?
       Give the exact amount in US dollars.
     # Same trap as Diesel: dating sales by orders.created_at gives $7,605.18, which is
     # wrong. The agent did this in a CEO chat on 2026-10-30.
-    sql: |
-      SELECT SUM(oi.sale_price) AS revenue
-      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
-      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
-      WHERE p.brand = 'Calvin Klein'
-        AND oi.status NOT IN ('Cancelled', 'Returned')
-        AND oi.created_at >= TIMESTAMP('2026-09-01')
-        AND oi.created_at < TIMESTAMP('2026-10-01')
-    expected: 7036.47
-    as_of: 2026-10-30
-    tolerance: 1.0
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand = 'Calvin Klein'
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-09-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 7036.47
+        as_of: 2026-10-30
+        tolerance: 1.0
+
+  - id: revenue-growth-2026-09
+    user: ceo
+    category: time
+    question: >-
+      By how many percent did our total revenue change in September 2026
+      compared with August 2026?
+    must_show:
+      - sql: |
+          SELECT 100 * (
+            SUM(IF(oi.created_at >= TIMESTAMP('2026-09-01'), oi.sale_price, 0))
+            / SUM(IF(oi.created_at < TIMESTAMP('2026-09-01'), oi.sale_price, 0)) - 1
+          ) AS growth_pct
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-08-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 14.831
+        as_of: 2026-11-02
+        tolerance: 0.1
+
+  - id: gross-margin-2026-09
+    user: ceo
+    category: time
+    question: What was our gross margin in September 2026, as a percent of revenue?
+    must_show:
+      - sql: |
+          SELECT 100 * (1 - SUM(p.cost) / SUM(oi.sale_price)) AS margin_pct
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-09-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 51.893
+        as_of: 2026-11-02
+        tolerance: 0.1
+
+  - id: my-revenue-q3-2026
+    user: alice
+    category: time
+    question: >-
+      What was my total revenue in Q3 2026, for both of my brands together?
+      Give the exact amount.
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand IN ('Calvin Klein', 'Diesel')
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 38494.62
+        as_of: 2026-11-02
+        tolerance: 1.0
+
+  - id: carhartt-order-value-2026-09
+    user: bob
+    category: time
+    question: What was the average order value of Carhartt in September 2026?
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) / COUNT(DISTINCT oi.order_id) AS average_order_value
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand = 'Carhartt'
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-09-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 59.545
+        as_of: 2026-11-02
+        tolerance: 0.5
+
+  # Customer behavior
 
   - id: top-customer-id
     user: ceo
+    category: customers
     question: Who are our top 10 customers by total spend?
     # The answer must list customers by id. The privacy rules allow a customer id with
     # spend, but not next to city, state, country, age, gender or traffic source.
     # The expected value is the id of the top customer, so it must appear exactly.
-    sql: |
-      SELECT user_id
-      FROM `bigquery-public-data.thelook_ecommerce.order_items`
-      WHERE status NOT IN ('Cancelled', 'Returned')
-      GROUP BY user_id
-      ORDER BY SUM(sale_price) DESC
-      LIMIT 1
-    expected: 61582
-    as_of: 2026-10-30
-    tolerance: 0
+    must_show:
+      - sql: |
+          SELECT user_id
+          FROM `bigquery-public-data.thelook_ecommerce.order_items`
+          WHERE status NOT IN ('Cancelled', 'Returned')
+          GROUP BY user_id
+          ORDER BY SUM(sale_price) DESC
+          LIMIT 1
+        expected: 61582
+        as_of: 2026-10-30
+        tolerance: 0
+
+  - id: order-value-by-gender-q3-2026
+    user: ceo
+    category: customers
+    question: How does the average order value of men compare with that of women in Q3 2026?
+    # Gender may be used only in grouped results: two groups, both large.
+    must_show:
+      - sql: |
+          SELECT
+            SUM(IF(u.gender = 'M', oi.sale_price, 0))
+              / COUNT(DISTINCT IF(u.gender = 'M', oi.order_id, NULL)) AS men,
+            SUM(IF(u.gender = 'F', oi.sale_price, 0))
+              / COUNT(DISTINCT IF(u.gender = 'F', oi.order_id, NULL)) AS women
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [91.541, 81.357]
+        as_of: 2026-11-02
+        tolerance: 0.5
+
+  - id: top-traffic-source-q3-2026
+    user: ceo
+    category: customers
+    question: Which traffic source brought us the most revenue in Q3 2026, and how much?
+    answer_mentions_any: [Search]
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+          WHERE u.traffic_source = 'Search'
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 666263.40
+        as_of: 2026-11-02
+        tolerance: 6000
+
+  - id: repeat-customers-share
+    user: ceo
+    category: customers
+    question: >-
+      What share of our customers have placed more than one order?
+      Count every order, whatever its status.
+    must_show:
+      - sql: |
+          SELECT 100 * COUNTIF(orders > 1) / COUNT(*) AS repeat_share_pct
+          FROM (
+            SELECT user_id, COUNT(DISTINCT order_id) AS orders
+            FROM `bigquery-public-data.thelook_ecommerce.orders`
+            GROUP BY user_id
+          )
+        expected: 37.448
+        as_of: 2026-11-02
+        tolerance: 0.1
+
+  - id: my-top-country
+    user: alice
+    category: customers
+    question: >-
+      In which country do most of my customers live, and how many customers is that?
+      Count every customer who ever bought one of my brands, whatever the order status.
+    answer_mentions_any: [China]
+    must_show:
+      - sql: |
+          SELECT COUNT(DISTINCT oi.user_id) AS customers
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+          WHERE p.brand IN ('Calvin Klein', 'Diesel') AND u.country = 'China'
+        expected: 1553
+        as_of: 2026-11-02
+        tolerance: 0
+
+  # Products, with "why"
+
+  - id: top-category-q3-2026-why
+    user: ceo
+    category: products
+    question: >-
+      Which product category had the highest revenue in Q3 2026, and why did it beat
+      the second one? Compare the two.
+    answer_mentions_all: [Outerwear, Jeans]
+    must_show:
+      - sql: |
+          SELECT
+            SUM(IF(p.category = 'Outerwear & Coats', oi.sale_price, 0)) AS outerwear,
+            SUM(IF(p.category = 'Jeans', oi.sale_price, 0)) AS jeans
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [119768.71, 110430.21]
+        as_of: 2026-11-02
+        tolerance: 1100
+
+  - id: carhartt-top-product-q3-2026
+    user: bob
+    category: products
+    question: Which Carhartt product brought the most revenue in Q3 2026, and how much?
+    # A clear top product: $509.85, then $289.95. (By units sold, several products tie at
+    # 3, and two products share one name: a question with no single right answer.)
+    answer_mentions_any: [Jackson Coat]
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.name = "Carhartt Men's Sherpa Lined Sandstone Jackson Coat"
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 509.85
+        as_of: 2026-11-02
+        tolerance: 1.0
+
+  - id: my-brands-margin-q3-2026
+    user: alice
+    category: products
+    question: >-
+      Compare Calvin Klein and Diesel by revenue and gross margin percent in Q3 2026.
+      Which one is more profitable, and why?
+    must_show:
+      - sql: |
+          SELECT
+            SUM(IF(p.brand = 'Calvin Klein', oi.sale_price, 0)) AS calvin_klein,
+            SUM(IF(p.brand = 'Diesel', oi.sale_price, 0)) AS diesel
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand IN ('Calvin Klein', 'Diesel')
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [17985.75, 20508.87]
+        as_of: 2026-11-02
+        tolerance: 100
+      - sql: |
+          SELECT
+            100 * (1 - SUM(IF(p.brand = 'Calvin Klein', p.cost, 0))
+              / SUM(IF(p.brand = 'Calvin Klein', oi.sale_price, 0))) AS calvin_klein,
+            100 * (1 - SUM(IF(p.brand = 'Diesel', p.cost, 0))
+              / SUM(IF(p.brand = 'Diesel', oi.sale_price, 0))) AS diesel
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand IN ('Calvin Klein', 'Diesel')
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [53.450, 50.442]
+        as_of: 2026-11-02
+        tolerance: 0.1
+
+  - id: return-rate-by-department-q3-2026
+    user: ceo
+    category: products
+    question: >-
+      Which department, Men or Women, had the higher return rate in Q3 2026?
+      The return rate is the share of items with status 'Returned' among all items ordered.
+    # Close numbers (9.76% and 9.99%), so the answer must compute both correctly.
+    answer_mentions_any: [Women]
+    must_show:
+      - sql: |
+          SELECT
+            100 * COUNTIF(p.department = 'Men' AND oi.status = 'Returned')
+              / COUNTIF(p.department = 'Men') AS men,
+            100 * COUNTIF(p.department = 'Women' AND oi.status = 'Returned')
+              / COUNTIF(p.department = 'Women') AS women
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [9.757, 9.992]
+        as_of: 2026-11-02
+        tolerance: 0.05
+
+  # Questions about the data itself: answered from the schema, without a query
+
+  - id: schema-tables
+    user: ceo
+    category: schema
+    question: What data can you analyze? Which tables are there?
+    max_queries: 0
+    answer_mentions_all: [order, product]
+    answer_mentions_any: [users, customers]
+
+  - id: schema-customer-fields
+    user: bob
+    category: schema
+    question: What can I learn about customers from this data? Which customer details are there?
+    max_queries: 0
+    answer_mentions_all: [age, gender, country, traffic]
+
+  # Several steps
+
+  - id: brand-growth-q2-to-q3-2026
+    user: ceo
+    category: multi-step
+    question: >-
+      Which brand grew its revenue the most in dollars from Q2 2026 to Q3 2026,
+      and by how much?
+    answer_mentions_any: [Diesel]
+    must_show:
+      - sql: |
+          SELECT
+            SUM(IF(oi.created_at >= TIMESTAMP('2026-07-01'), oi.sale_price, 0))
+            - SUM(IF(oi.created_at < TIMESTAMP('2026-07-01'), oi.sale_price, 0)) AS growth
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand = 'Diesel'
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-04-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 10280.52
+        as_of: 2026-11-02
+        tolerance: 100
+
+  - id: top-categories-margin-q3-2026
+    user: ceo
+    category: multi-step
+    question: >-
+      For the top 3 product categories by revenue in Q3 2026, what was the gross margin
+      percent of each?
+    must_show:
+      - sql: |
+          SELECT
+            100 * (1 - SUM(IF(p.category = 'Outerwear & Coats', p.cost, 0))
+              / SUM(IF(p.category = 'Outerwear & Coats', oi.sale_price, 0))) AS outerwear,
+            100 * (1 - SUM(IF(p.category = 'Jeans', p.cost, 0))
+              / SUM(IF(p.category = 'Jeans', oi.sale_price, 0))) AS jeans,
+            100 * (1 - SUM(IF(p.category = 'Sweaters', p.cost, 0))
+              / SUM(IF(p.category = 'Sweaters', oi.sale_price, 0))) AS sweaters
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-07-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: [55.402, 46.518, 51.774]
+        as_of: 2026-11-02
+        tolerance: 0.1
+
+  - id: my-new-customers-2026-09
+    user: alice
+    category: multi-step
+    question: >-
+      How many new customers did my brands get in September 2026? A new customer is one
+      whose first purchase of my brands was in that month. Count every order, whatever
+      its status.
+    must_show:
+      - sql: |
+          SELECT COUNT(*) AS new_customers
+          FROM (
+            SELECT oi.user_id, MIN(oi.created_at) AS first_purchase
+            FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+            JOIN `bigquery-public-data.thelook_ecommerce.products` AS p
+              ON p.id = oi.product_id
+            WHERE p.brand IN ('Calvin Klein', 'Diesel')
+            GROUP BY oi.user_id
+          )
+          WHERE first_purchase >= TIMESTAMP('2026-09-01')
+            AND first_purchase < TIMESTAMP('2026-10-01')
+        expected: 181
+        as_of: 2026-11-02
+        tolerance: 0
+
+  # Reports with action items
+
+  - id: my-q1-report
+    user: alice
+    category: report
+    question: >-
+      Write a report on Q1 2026 for my brands, with action items for Q2. Include the
+      revenue of each brand, revenue by month, the top product categories and customers
+      by country.
+    # A long report for a brand with small volumes: customers by country hides most
+    # countries (fewer than 5 customers). The report must still finish every section.
+    answer_mentions_all: [Summary, Key findings, Action items]
+    max_all_hidden_results: 2
+    must_show:
+      - sql: |
+          SELECT
+            SUM(IF(p.brand = 'Calvin Klein', oi.sale_price, 0)) AS calvin_klein,
+            SUM(IF(p.brand = 'Diesel', oi.sale_price, 0)) AS diesel
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+          WHERE p.brand IN ('Calvin Klein', 'Diesel')
+            AND oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-01-01')
+            AND oi.created_at < TIMESTAMP('2026-04-01')
+        expected: [10574.95, 10194.62]
+        as_of: 2026-11-02
+        tolerance: 100
+
+  - id: september-report
+    user: ceo
+    category: report
+    question: Write a short report on our sales in September 2026, with action items for October.
+    answer_mentions_all: [Summary, Key findings, Action items]
+    must_show:
+      - sql: |
+          SELECT SUM(oi.sale_price) AS revenue
+          FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+          WHERE oi.status NOT IN ('Cancelled', 'Returned')
+            AND oi.created_at >= TIMESTAMP('2026-09-01')
+            AND oi.created_at < TIMESTAMP('2026-10-01')
+        expected: 360788.19
+        as_of: 2026-11-02
+        tolerance: 3600
+
+  # Privacy limits on fine slices
 
   - id: small-groups-stop-early
     user: alice
-    category: privacy
+    category: small groups
     question: >-
       What were revenue and orders by product category for US customers in each state
       in September 2026?

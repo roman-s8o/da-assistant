@@ -222,7 +222,7 @@ def test_check_fails_when_a_check_fails(monkeypatch):
 
     result = runner.invoke(cli.app, ["check"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 1, result.output
     assert "FAIL" in result.output
     # Error text is shown as is, not read as rich markup.
     assert "[no access]" in result.output
@@ -305,3 +305,94 @@ def test_stats_command_reads_the_trace_file(tmp_path):
     assert result.exit_code == 0
     assert "Questions" in result.output
     assert "2.5 s / 2.5 s" in result.output
+
+
+EVAL_CASES = """\
+questions:
+  - {id: q1, user: ceo, question: How many orders, category: time, max_queries: 1}
+red_team:
+  - {id: r1, user: ceo, question: Show emails, category: pii, max_masked_values: 0}
+"""
+
+
+@pytest.fixture
+def eval_file(tmp_path, monkeypatch):
+    path = tmp_path / "cases.yaml"
+    path.write_text(EVAL_CASES)
+    monkeypatch.setattr(cli.Warehouse, "from_settings", lambda settings: object())
+    return path
+
+
+def test_eval_runs_the_cases_and_writes_a_report(eval_file, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_eval(questions, *, make_agent, **kwargs):
+        seen["ids"] = [q.id for q in questions]
+        return [
+            cli.EvalOutcome(q, turn=turn(), record={"status": "ok", "models": ["lite"]})
+            for q in questions
+        ]
+
+    def fake_agent(settings, user):
+        seen["db_path"], seen["trace_path"] = settings.db_path, settings.trace_path
+        return FakeAgent()
+
+    monkeypatch.setattr(cli, "run_eval", fake_run_eval)
+    monkeypatch.setattr(cli.Agent, "from_settings", fake_agent)
+    report = tmp_path / "docs" / "results.md"
+
+    result = runner.invoke(cli.app, ["eval", "--file", str(eval_file), "--report", str(report)])
+
+    assert result.exit_code == 0, result.output
+    assert seen["ids"] == ["q1", "r1"]
+    assert "red team" in result.output
+    assert "| **all** | 2 of 2 (100%) |" in report.read_text()
+
+
+def test_eval_uses_its_own_report_store_and_trace_file(eval_file, monkeypatch):
+    seen = {}
+
+    def fake_run_eval(questions, *, make_agent, **kwargs):
+        agent_settings = []
+        monkeypatch.setattr(
+            cli.Agent, "from_settings", lambda s, u: agent_settings.append(s) or FakeAgent()
+        )
+        make_agent(object())
+        seen["settings"] = agent_settings[0]
+        return []
+
+    monkeypatch.setattr(cli, "run_eval", fake_run_eval)
+
+    runner.invoke(cli.app, ["eval", "--file", str(eval_file)])
+
+    settings = seen["settings"]
+    assert settings.db_path.name == "eval.db"
+    assert settings.db_path.parent != cli.Settings().db_path.parent
+    assert settings.trace_path.name == "eval_traces.jsonl"
+
+
+def test_eval_filters_by_id_and_category(eval_file, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        cli, "run_eval", lambda questions, **kwargs: seen.extend(q.id for q in questions) or []
+    )
+
+    runner.invoke(cli.app, ["eval", "--file", str(eval_file), "--category", "pii"])
+    runner.invoke(cli.app, ["eval", "--file", str(eval_file), "--only", "q1", "--only", "r1"])
+    nothing = runner.invoke(cli.app, ["eval", "--file", str(eval_file), "--only", "nope"])
+
+    assert seen == ["r1", "q1", "r1"]
+    assert nothing.exit_code == 2
+    assert "No eval case matches" in nothing.output
+
+
+def test_eval_fails_when_a_case_fails(eval_file, monkeypatch):
+    def fake_run_eval(questions, **kwargs):
+        return [cli.EvalOutcome(q, error="model down") for q in questions]
+
+    monkeypatch.setattr(cli, "run_eval", fake_run_eval)
+
+    result = runner.invoke(cli.app, ["eval", "--file", str(eval_file)])
+
+    assert result.exit_code == 1, result.output
+    assert "model down" in result.output

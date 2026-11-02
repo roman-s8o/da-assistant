@@ -6,6 +6,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 USERS_FILE = ROOT / "config" / "users.yaml"
 QUESTIONS_FILE = ROOT / "evals" / "questions.yaml"
+RED_TEAM_FILE = ROOT / "evals" / "red_team.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -27,5 +28,11 @@ def users_file() -> Path:
 
 @pytest.fixture
 def questions_file() -> Path:
-    """The eval question set shipped with the project."""
+    """The analysis questions of the eval, shipped with the project."""
     return QUESTIONS_FILE
+
+
+@pytest.fixture
+def red_team_file() -> Path:
+    """The red-team cases of the eval, shipped with the project."""
+    return RED_TEAM_FILE

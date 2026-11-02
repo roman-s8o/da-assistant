@@ -27,6 +27,12 @@ def test_success_rate_leaves_out_right_refusals_and_guard_blocks():
     assert result["Refusals by the data rules"] == "1"
 
 
+def test_guard_model_failures():
+    turns = [turn(guard_source="model"), turn(guard_source="rules only"), turn()]
+
+    assert metrics(turns)["Guard model failures (rules only)"] == "1"
+
+
 def test_self_correction_rate():
     turns = [turn(failed_queries=1, self_corrected=True), turn(failed_queries=2), turn()]
 

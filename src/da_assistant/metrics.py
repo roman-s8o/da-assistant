@@ -53,6 +53,10 @@ def summarize(turns: list[dict[str, Any]]) -> list[tuple[str, str]]:
         ("Refusals by the data rules", str(len(refusals))),
         ("Guard blocks", str(len(blocked))),
         (
+            "Guard model failures (rules only)",
+            str(sum(1 for t in turns if t.get("guard_source") == "rules only")),
+        ),
+        (
             "Answers that quoted the instructions",
             str(sum(1 for t in turns if t.get("blocked") == "leak")),
         ),
