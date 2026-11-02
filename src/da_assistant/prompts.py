@@ -93,8 +93,11 @@ The user has a library of saved reports. You can see only their own reports.
 """
 
 _BRAND_SCOPE = """- All tables already hold only the brands this user can analyze: {brands}.
-  You do not need a brand filter. If the user asks about other brands, say that
-  they can analyze only these brands.
+  You do not need a brand filter, and you do not need to check which brands exist.
+- The store sells many other brands, but this user cannot see their data. If the user
+  asks about other brands or the whole store, say that they can analyze only {brands}.
+  Never say that other brands do not exist or that the store has only these brands.
+  Then you may answer for the user's own brands, with numbers from a query you ran.
 """
 
 _NO_MORE_QUERIES = """
