@@ -8,7 +8,10 @@ docs/ARCHITECTURE.md). So retrying an overloaded model mostly makes the user wai
   exponential backoff and jitter, but only while less than `retry_window_s` has passed
   since the first attempt. A quick failure, such as a 429, gets a retry. A slow failure
   goes straight to the fallback model.
-- "Model not found" (404) is not retried: the fallback model takes over.
+- "Model not found" (404) and a used-up quota per day (a 429 that says so) are not
+  retried: the fallback model takes over. A quota per day comes back only at midnight
+  Pacific time, and each model has its own (on 2026-11-02 the free tier allowed 500
+  requests a day for gemini-3.5-flash-lite and 20 for gemini-3.8-flash).
 - Other errors (400, 401, 403) are raised: another model would fail the same way.
 - After the primary model fails, it is skipped for `cooldown_s`, so the next calls do
   not wait for it again (a simple circuit breaker). Then it gets another chance.
@@ -31,7 +34,11 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+from da_assistant.errors import daily_quota_reached
+
 TEMPORARY_CODES = frozenset({408, 429, 500, 502, 503, 504})
+# The error label of a used-up quota per day, in the traces.
+DAILY_QUOTA_LABEL = "429 per day"
 _NETWORK_ERRORS = (httpx.TimeoutException, httpx.NetworkError, TimeoutError, ConnectionError)
 
 
@@ -47,6 +54,8 @@ def error_code(exc: BaseException) -> int | None:
 
 
 def is_temporary(exc: BaseException) -> bool:
+    if daily_quota_reached(exc):
+        return False
     current: BaseException | None = exc
     while current is not None:
         if isinstance(current, _NETWORK_ERRORS):
@@ -56,11 +65,13 @@ def is_temporary(exc: BaseException) -> bool:
 
 
 def worth_fallback(exc: BaseException) -> bool:
-    return is_temporary(exc) or error_code(exc) == 404
+    return is_temporary(exc) or error_code(exc) == 404 or daily_quota_reached(exc)
 
 
 def error_label(exc: BaseException) -> str:
-    """A short label for traces, for example "503" or "timeout"."""
+    """A short label for traces, for example "503", "429 per day" or "timeout"."""
+    if daily_quota_reached(exc):
+        return DAILY_QUOTA_LABEL
     code = error_code(exc)
     if code is not None:
         return str(code)

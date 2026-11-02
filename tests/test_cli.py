@@ -396,3 +396,17 @@ def test_eval_fails_when_a_case_fails(eval_file, monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert "model down" in result.output
+
+
+def test_eval_writes_nothing_when_the_daily_quota_is_used_up(eval_file, tmp_path, monkeypatch):
+    def fake_run_eval(questions, **kwargs):
+        raise cli.DailyQuotaReached("q1", 0, 2)
+
+    monkeypatch.setattr(cli, "run_eval", fake_run_eval)
+    report = tmp_path / "results.md"
+
+    result = runner.invoke(cli.app, ["eval", "--file", str(eval_file), "--report", str(report)])
+
+    assert result.exit_code == 2
+    assert "No results were written" in result.output
+    assert not report.exists()

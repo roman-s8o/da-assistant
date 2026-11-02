@@ -246,3 +246,24 @@ def test_the_turn_shows_when_the_guard_model_failed(tmp_path):
     agent.ask("q", thread_id="t")
 
     assert agent.last_trace.record["guard_source"] == "rules only"
+
+
+def test_the_turn_shows_a_used_up_daily_quota(tmp_path):
+    tracer, _ = trace_file(tmp_path)
+    guard = FakeGuard(source="rules only", error="429 per day")
+
+    agent = make_agent(FakeModel(answer("x")), FakeSqlTool(), guard=guard, tracer=tracer)
+    agent.ask("q", thread_id="t")
+
+    assert agent.last_trace.record["daily_quota"]
+    guard_span = next(s for s in agent.last_trace.spans if s["span"] == "guard")
+    assert guard_span["model_errors"] == ["429 per day"]
+
+
+def test_a_normal_turn_has_no_daily_quota_flag(tmp_path):
+    tracer, _ = trace_file(tmp_path)
+
+    agent = make_agent(FakeModel(answer("x")), FakeSqlTool(), tracer=tracer)
+    agent.ask("q", thread_id="t")
+
+    assert agent.last_trace.record["daily_quota"] is False

@@ -19,6 +19,7 @@ from da_assistant.agent import Agent, Confirmation, TurnResult
 from da_assistant.config import ConfigError, Settings, UserProfile, load_settings, load_users
 from da_assistant.errors import explain
 from da_assistant.evals import (
+    DailyQuotaReached,
     EvalOutcome,
     check_lines,
     group_results,
@@ -176,15 +177,18 @@ def eval_command(
             warehouse = Warehouse.from_settings(eval_settings)
         except Exception as exc:  # setup errors end the run with a clear message
             _fail(explain(exc))
-        with console.status("Running the eval...") as status:
-            outcomes = run_eval(
-                questions,
-                users=users,
-                warehouse=warehouse,
-                make_agent=lambda user: Agent.from_settings(eval_settings, user),
-                on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
-                pause_s=pause,
-            )
+        try:
+            with console.status("Running the eval...") as status:
+                outcomes = run_eval(
+                    questions,
+                    users=users,
+                    warehouse=warehouse,
+                    make_agent=lambda user: Agent.from_settings(eval_settings, user),
+                    on_question=lambda question: status.update(escape(f"Asking: {question.id}")),
+                    pause_s=pause,
+                )
+        except DailyQuotaReached as exc:
+            _fail(f"{exc} No results were written.")
 
     table = Table("", "Case", "Model", "Checks", "Answer", show_lines=True)
     for outcome in outcomes:
@@ -263,6 +267,8 @@ def span_details(span: dict) -> str:
     tokens = f"{span.get('input_tokens', 0):,} in / {span.get('output_tokens', 0):,} out"
     if kind == "guard":
         text = f"{span.get('category')} ({span.get('source')}), {span.get('model')}, {tokens}"
+        if span.get("model_errors"):
+            text += f" (errors: {', '.join(span['model_errors'])})"
     elif kind == "agent":
         model = span.get("model", "?") + (" (fallback)" if span.get("fallback") else "")
         text = f"{model}, {_count(span.get('attempts', 1), 'attempt', 'attempts')}"

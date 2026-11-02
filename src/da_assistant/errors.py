@@ -1,6 +1,9 @@
 """Short, readable error messages, with a hint when we know the fix."""
 
 import re
+from datetime import UTC, datetime, time, timedelta, timezone, tzinfo
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.api_core import exceptions as gcp_errors
 from google.auth import exceptions as auth_errors
@@ -30,6 +33,46 @@ def is_rate_limit(exc: BaseException) -> bool:
     if isinstance(exc, genai_errors.APIError):
         return exc.code == 429
     return isinstance(exc, gcp_errors.TooManyRequests)
+
+
+def daily_quota_reached(exc: BaseException) -> bool:
+    """A quota per day is used up, for example the 500 free requests a day of a model.
+
+    Unlike a limit per minute, waiting a little or retrying does not help: the quota comes
+    back only when it resets. Another model has a quota of its own.
+    """
+    if not is_rate_limit(exc):
+        return False
+    return any(
+        "PerDay" in str(violation.get("quotaId", ""))
+        for detail in _error_details(exc)
+        for violation in detail.get("violations") or ()
+        if isinstance(violation, dict)
+    )
+
+
+def daily_quota_resets_at(now: datetime | None = None) -> datetime:
+    """When the Gemini quotas per day reset next, in UTC.
+
+    They reset at midnight Pacific time (https://ai.google.dev/gemini-api/docs/rate-limits).
+    """
+    try:
+        zone: tzinfo = ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:  # Windows without the tzdata package: standard time
+        zone = timezone(timedelta(hours=-8))
+    pacific = (now or datetime.now(UTC)).astimezone(zone)
+    tomorrow = pacific.date() + timedelta(days=1)
+    return datetime.combine(tomorrow, time(0), tzinfo=zone).astimezone(UTC)
+
+
+def _error_details(exc: BaseException) -> list[dict[str, Any]]:
+    """The structured details of a Gemini API error, such as the quota that was hit."""
+    details = getattr(_api_cause(exc), "details", None)
+    if isinstance(details, dict):
+        details = (details.get("error") or {}).get("details")
+    if not isinstance(details, list):
+        return []
+    return [detail for detail in details if isinstance(detail, dict)]
 
 
 def short_message(exc: BaseException, max_chars: int = 300) -> str:
@@ -70,6 +113,12 @@ def _hint(exc: BaseException) -> str | None:
             return "check GEMINI_API_KEY."
         if exc.code == 404:
             return "model not found. Set DA_LLM_MODEL or DA_LLM_FALLBACK_MODEL."
+        if daily_quota_reached(exc):
+            reset = daily_quota_resets_at()
+            return (
+                "the daily quota of this Gemini model is used up. It resets at midnight "
+                f"Pacific time ({reset:%H:%M} UTC)."
+            )
         if exc.code == 429:
             return "rate limit or quota reached. Wait a minute and try again."
         if exc.code >= 500:

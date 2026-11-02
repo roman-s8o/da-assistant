@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+from google.genai import errors as genai_errors
 from langchain_core.messages import AIMessage
 
 from da_assistant.agent import Agent, Budget
@@ -73,16 +74,23 @@ class FakeGuard:
 
     model_name = "gemini-3.5-flash-lite"
 
-    def __init__(self, category="analysis", llm_calls=0, source="model"):
+    def __init__(self, category="analysis", llm_calls=0, source="model", error=None):
         self.category = category
         self.llm_calls = llm_calls
         self.source = source
+        self.error = error
         self.calls = []  # (message, scope, last_answer)
 
     def check(self, message, *, scope, last_answer=""):
         self.calls.append((message, scope, last_answer))
         return GuardResult(
-            self.category, "test", self.source, self.llm_calls, 7 * self.llm_calls, self.llm_calls
+            self.category,
+            "test",
+            self.source,
+            self.llm_calls,
+            7 * self.llm_calls,
+            self.llm_calls,
+            error=self.error,
         )
 
 
@@ -121,3 +129,11 @@ def tool_call(name, call_id="r1", **args):
     return AIMessage(
         "", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
     )
+
+
+def quota_error(period: str = "Day") -> genai_errors.ClientError:
+    """A Gemini 429 like the real one: a quota per day ("Day") or per minute ("Minute")."""
+    violation = {"quotaId": f"GenerateRequestsPer{period}PerProjectPerModel-FreeTier"}
+    details = [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [violation]}]
+    body = {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED", "details": details}
+    return genai_errors.ClientError(429, {"error": body})

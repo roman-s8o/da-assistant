@@ -49,6 +49,7 @@ from da_assistant.pricing import model_cost, query_cost
 from da_assistant.privacy import mask_text
 from da_assistant.prompts import guard_answer, system_prompt
 from da_assistant.reports import Report, ReportStore, confirmation_word
+from da_assistant.resilience import DAILY_QUOTA_LABEL
 from da_assistant.schema import column_types, schema_text
 from da_assistant.sql_tool import SqlTool, hidden_groups_summary
 from da_assistant.tools import (
@@ -372,6 +373,8 @@ class Agent:
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
             )
+            if result.error:
+                span.update(model_errors=[result.error])
         update: dict[str, Any] = {
             "llm_calls": state["llm_calls"] + result.llm_calls,
             "input_tokens": state["input_tokens"] + result.input_tokens,
@@ -720,6 +723,8 @@ def turn_record(
         "question": guard.get("question", fingerprint("")),
         # Which guard layer decided: "rules", "model", or "rules only" when the model failed.
         "guard_source": guard.get("source"),
+        # A model call hit a used-up quota per day (the fallback model may have answered).
+        "daily_quota": any(DAILY_QUOTA_LABEL in s.get("model_errors", []) for s in turn.spans),
         "answer": fingerprint(answer),
         "answered": status == "ok" and not blocked and not refusal and not gave_up and bool(answer),
         "blocked": blocked,

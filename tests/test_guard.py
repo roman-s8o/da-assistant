@@ -1,4 +1,5 @@
 import pytest
+from fakes import quota_error
 from langchain_core.messages import AIMessage
 
 from da_assistant.guard import REPLIES, Guard, GuardVerdict
@@ -100,6 +101,15 @@ def test_guard_model_failure_lets_the_message_through():
 
     assert not result.blocked
     assert result.source == "rules only"
+    assert result.error == "RuntimeError"
+
+
+def test_a_guard_model_out_of_daily_quota_says_so():
+    guard, _ = guard_with(error=quota_error("Day"))
+
+    result = guard.check("Revenue by month?", scope="all brands")
+
+    assert (result.source, result.error) == ("rules only", "429 per day")
 
 
 def test_unreadable_guard_answer_lets_the_message_through():

@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from da_assistant.errors import short_message
+from da_assistant.resilience import error_label
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ class GuardResult:
     llm_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Why the guard model failed, for the traces: for example "503" or "429 per day".
+    error: str | None = None
 
     @property
     def blocked(self) -> bool:
@@ -120,7 +123,10 @@ class Guard:
         except Exception as exc:  # the data rules still hold, so the turn goes on
             logger.warning("Guard model failed: %s", exc)
             return GuardResult(
-                "analysis", f"Guard model failed: {short_message(exc)}", "rules only"
+                "analysis",
+                f"Guard model failed: {short_message(exc)}",
+                "rules only",
+                error=error_label(exc),
             )
 
         usage = output["raw"].usage_metadata or {}

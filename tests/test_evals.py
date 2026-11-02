@@ -3,11 +3,13 @@ from datetime import date
 
 import pandas as pd
 import pytest
+from fakes import quota_error
 from google.genai import errors as genai_errors
 
 from da_assistant.agent import QueryLog, TurnResult
 from da_assistant.config import ConfigError, load_users
 from da_assistant.evals import (
+    DailyQuotaReached,
     EvalOutcome,
     EvalQuestion,
     KnownNumbers,
@@ -476,6 +478,22 @@ def test_a_second_rate_limit_fails_the_case():
     assert outcome.attempts == 2
     assert "rate limit" in outcome.error
     assert len(waits) == 1
+
+
+def test_a_used_up_daily_quota_stops_the_run():
+    agent = FakeAgent(error=quota_error("Day"))
+
+    with pytest.raises(DailyQuotaReached, match=r"case q \(0 of 2 cases done\)"):
+        run_paced(agent, questions=(NUMBER, NUMBER), rate_limit_wait_s=60)
+
+    assert len(agent.threads) == 1  # no second try, no wait for a minute
+
+
+def test_a_daily_quota_stops_the_run_also_when_the_fallback_answered():
+    agent = FakeAgent("$100", daily_quota=True)
+
+    with pytest.raises(DailyQuotaReached, match="resets at midnight Pacific time"):
+        run(agent)
 
 
 def test_run_eval_error_fails_only_that_question():

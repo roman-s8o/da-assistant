@@ -26,7 +26,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -35,7 +35,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, mo
 
 from da_assistant.agent import Agent, TurnResult
 from da_assistant.config import ConfigError, UserProfile
-from da_assistant.errors import explain, is_rate_limit
+from da_assistant.errors import (
+    daily_quota_reached,
+    daily_quota_resets_at,
+    explain,
+    is_rate_limit,
+)
 from da_assistant.metrics import summarize
 from da_assistant.warehouse import Warehouse
 
@@ -290,6 +295,10 @@ def run_eval(
 
     A free Gemini key allows only a few calls a minute. `pause_s` waits between cases,
     and a case stopped by a rate limit runs once more after `rate_limit_wait_s`.
+
+    A used-up quota per day stops the whole run with `DailyQuotaReached`, also when the
+    fallback model answered that turn: the cases after it would fail or run on another
+    model, so the results would not be comparable.
     """
     agents: dict[str, Agent] = {}
     outcomes = []
@@ -301,15 +310,32 @@ def run_eval(
         for attempt in (1, 2):
             try:
                 outcome = _run_case(question, agents, users, warehouse, make_agent)
-                outcomes.append(replace(outcome, attempts=attempt))
-                break
             except Exception as exc:  # one broken case must not stop the eval
+                if daily_quota_reached(exc):
+                    raise DailyQuotaReached(question.id, len(outcomes), len(questions)) from exc
                 if attempt == 1 and is_rate_limit(exc):
                     sleep(rate_limit_wait_s)
                     continue
                 outcomes.append(EvalOutcome(question, error=explain(exc), attempts=attempt))
                 break
+            if outcome.record.get("daily_quota"):
+                raise DailyQuotaReached(question.id, len(outcomes), len(questions))
+            outcomes.append(replace(outcome, attempts=attempt))
+            break
     return outcomes
+
+
+class DailyQuotaReached(Exception):
+    """A model's quota per day is used up, so the eval stopped."""
+
+    def __init__(self, case_id: str, done: int, total: int) -> None:
+        reset = daily_quota_resets_at()
+        hours = (reset - datetime.now(UTC)).total_seconds() / 3600
+        super().__init__(
+            f"The eval stopped at case {case_id} ({done} of {total} cases done): the daily "
+            f"quota of a Gemini model is used up. It resets at midnight Pacific time, "
+            f"{reset:%Y-%m-%d %H:%M} UTC, in about {hours:.0f} h."
+        )
 
 
 def _run_case(

@@ -1,10 +1,19 @@
+from datetime import UTC, datetime
+
 import pytest
+from fakes import quota_error
 from google.api_core import exceptions as gcp_errors
 from google.auth import exceptions as auth_errors
 from google.genai import errors as genai_errors
 
+from da_assistant import errors
 from da_assistant.config import ConfigError
-from da_assistant.errors import explain, is_rate_limit
+from da_assistant.errors import (
+    daily_quota_reached,
+    daily_quota_resets_at,
+    explain,
+    is_rate_limit,
+)
 
 
 def genai_error(code: int, message: str, status: str = "") -> genai_errors.APIError:
@@ -72,3 +81,43 @@ def test_is_rate_limit():
     assert is_rate_limit(gcp_errors.TooManyRequests("Quota exceeded"))
     assert not is_rate_limit(genai_error(503, "The model is busy."))
     assert not is_rate_limit(RuntimeError("other"))
+
+
+def test_daily_quota_reached():
+    wrapped = RuntimeError("LangChain wrapper")
+    wrapped.__cause__ = quota_error("Day")
+
+    assert daily_quota_reached(quota_error("Day"))
+    assert daily_quota_reached(wrapped)
+    assert not daily_quota_reached(quota_error("Minute"))
+    assert not daily_quota_reached(genai_error(429, "Resource exhausted"))
+    assert not daily_quota_reached(genai_error(503, "The model is busy."))
+
+
+@pytest.mark.parametrize(
+    ("now", "reset"),
+    [
+        # Winter: midnight Pacific is 08:00 UTC.
+        (datetime(2026, 11, 2, 12, 16, tzinfo=UTC), datetime(2026, 11, 3, 8, 0, tzinfo=UTC)),
+        (datetime(2026, 11, 3, 7, 59, tzinfo=UTC), datetime(2026, 11, 3, 8, 0, tzinfo=UTC)),
+        # Summer: 07:00 UTC.
+        (datetime(2026, 7, 1, 12, 0, tzinfo=UTC), datetime(2026, 7, 2, 7, 0, tzinfo=UTC)),
+    ],
+)
+def test_daily_quota_resets_at_midnight_pacific(now, reset):
+    assert daily_quota_resets_at(now) == reset
+
+
+def test_reset_time_without_time_zone_data(monkeypatch):
+    def no_zone(name):
+        raise errors.ZoneInfoNotFoundError(name)
+
+    monkeypatch.setattr(errors, "ZoneInfo", no_zone)
+    now = datetime(2026, 11, 2, 12, 16, tzinfo=UTC)
+
+    assert errors.daily_quota_resets_at(now) == datetime(2026, 11, 3, 8, 0, tzinfo=UTC)
+
+
+def test_a_daily_quota_gets_its_own_hint():
+    assert "daily quota" in explain(quota_error("Day"))
+    assert "Wait a minute" in explain(quota_error("Minute"))

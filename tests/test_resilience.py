@@ -2,9 +2,16 @@ import time
 
 import httpx
 import pytest
+from fakes import quota_error
 from google.genai import errors as genai_errors
 
-from da_assistant.resilience import ResilientChat, error_label, is_temporary, worth_fallback
+from da_assistant.resilience import (
+    DAILY_QUOTA_LABEL,
+    ResilientChat,
+    error_label,
+    is_temporary,
+    worth_fallback,
+)
 
 
 def api_error(code: int) -> genai_errors.APIError:
@@ -189,3 +196,23 @@ def test_without_a_fallback_the_last_error_is_raised_after_the_retries():
     with pytest.raises(genai_errors.ServerError):
         model.invoke("q")
     assert primary.calls == 3
+
+
+def test_a_used_up_daily_quota_goes_straight_to_the_fallback():
+    primary = FakeModel("flash-lite", wrapped(quota_error("Day")))
+    fallback = FakeModel("flash")
+    model = resilient(primary, fallback)
+
+    assert model.invoke("hi") == "answer from flash"
+    assert primary.calls == 1  # no retry: it comes back only at midnight Pacific time
+    assert model.last_call.errors == [DAILY_QUOTA_LABEL]
+    assert model.last_call.fallback
+
+
+def test_a_daily_quota_is_not_temporary_but_worth_the_fallback():
+    daily, per_minute = quota_error("Day"), quota_error("Minute")
+
+    assert (is_temporary(daily), worth_fallback(daily)) == (False, True)
+    assert (is_temporary(per_minute), worth_fallback(per_minute)) == (True, True)
+    assert error_label(daily) == "429 per day"
+    assert error_label(per_minute) == "429"
