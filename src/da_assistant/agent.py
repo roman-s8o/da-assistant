@@ -763,6 +763,7 @@ def _call_fields(model: Any) -> dict[str, Any]:
         "attempts": call.attempts,
         "model_errors": call.errors,
         "skipped_primary": call.skipped_primary,
+        "primary_retried": call.primary_retried,
         "model_seconds": round(call.seconds, 2),
     }
 

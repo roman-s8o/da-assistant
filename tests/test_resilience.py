@@ -165,6 +165,62 @@ def test_after_a_failure_the_primary_rests_for_the_cooldown():
     assert primary.calls == 2
 
 
+def test_a_failing_fallback_gives_the_resting_primary_one_more_attempt():
+    # Seen during development: the fallback returned 503 for minutes, while the resting
+    # primary still answered.
+    clock = Clock()
+    primary, fallback = FakeModel("big", api_error(503)), FakeModel("small")
+    model = resilient(primary, fallback, clock=clock, attempts=1, cooldown_s=300)
+    model.invoke("q")  # the primary fails and rests, the fallback answers
+    fallback.errors.append(api_error(503))
+
+    assert model.invoke("q") == "answer from big"
+    call = model.last_call
+    assert (call.model, call.fallback, call.primary_retried) == ("big", False, True)
+    assert (call.attempts, call.errors) == (2, ["503"])
+
+    # It answered, so it rests no more: the next call goes to it first.
+    assert model.invoke("q") == "answer from big"
+    assert (primary.calls, fallback.calls) == (3, 2)
+
+
+def test_the_resting_primary_gets_one_attempt_then_rests_again():
+    clock = Clock()
+    primary = FakeModel("big", *[api_error(503)] * 3)
+    fallback = FakeModel("small")
+    model = resilient(primary, fallback, clock=clock, attempts=3, cooldown_s=300)
+    model.invoke("q")  # three quick attempts of the primary, then the fallback answers
+    assert primary.calls == 3
+
+    clock.now += 200
+    fallback.errors.extend([api_error(503)] * 3)
+    primary.errors.extend([api_error(503)] * 2)
+    with pytest.raises(genai_errors.ServerError):
+        model.invoke("q")
+    assert primary.calls == 4  # one attempt, no retries
+    assert model.last_call.primary_retried
+    assert model.last_call.errors == ["503"] * 4
+
+    # Its rest starts again from this failure: still resting 200 seconds later.
+    clock.now += 200
+    assert model.invoke("q") == "answer from small"
+    assert primary.calls == 4
+
+
+def test_a_fallback_error_another_model_would_repeat_is_raised_at_once():
+    clock = Clock()
+    primary = FakeModel("big", api_error(503))
+    fallback = FakeModel("small")
+    model = resilient(primary, fallback, clock=clock, attempts=1)
+    model.invoke("q")
+    fallback.errors.append(api_error(400))
+
+    with pytest.raises(genai_errors.ClientError):
+        model.invoke("q")
+    assert primary.calls == 1
+    assert not model.last_call.primary_retried
+
+
 def test_copies_with_tools_share_the_cooldown():
     clock = Clock()
     primary = FakeModel("big", api_error(503))

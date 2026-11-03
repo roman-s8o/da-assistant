@@ -15,6 +15,9 @@ docs/ARCHITECTURE.md). So retrying an overloaded model mostly makes the user wai
 - Other errors (400, 401, 403) are raised: another model would fail the same way.
 - After the primary model fails, it is skipped for `cooldown_s`, so the next calls do
   not wait for it again (a simple circuit breaker). Then it gets another chance.
+- If the fallback model fails while the primary rests, the primary gets one more attempt,
+  with no retries. It may have recovered, or it may only be slow: during development the
+  fallback returned 503 for minutes while the primary still answered.
 
 The fallback model accepts the history as it is, including tool calls that the primary
 model made earlier in the turn (checked on 2026-10-30).
@@ -89,6 +92,8 @@ class CallInfo:
     seconds: float
     # The primary model was not tried: it is resting after a failure.
     skipped_primary: bool = False
+    # The primary model was resting, the fallback failed, so the primary got one more attempt.
+    primary_retried: bool = False
 
 
 @dataclass
@@ -141,8 +146,8 @@ class ResilientChat:
         start = self.clock()
         errors: list[str] = []
         attempts = [0]
-        skipped = False
-        if self.fallback is None or self.clock() >= self.health.primary_down_until:
+        resting = self.fallback is not None and self.clock() < self.health.primary_down_until
+        if not resting:
             try:
                 result = self._call(self.primary, messages, errors, attempts)
                 self._record(self.primary_name, False, attempts, errors, start)
@@ -152,14 +157,38 @@ class ResilientChat:
                     self._record(self.primary_name, False, attempts, errors, start)
                     raise
                 self.health.primary_down_until = self.clock() + self.cooldown_s
-        else:
-            skipped = True
         try:
-            return self._call(self.fallback, messages, errors, attempts)
-        finally:
-            self._record(self.fallback_name, True, attempts, errors, start, skipped)
+            result = self._call(self.fallback, messages, errors, attempts)
+        except Exception as exc:
+            if not (resting and worth_fallback(exc)):
+                self._record(self.fallback_name, True, attempts, errors, start, skipped=resting)
+                raise
+            return self._retry_resting_primary(messages, errors, attempts, start)
+        self._record(self.fallback_name, True, attempts, errors, start, skipped=resting)
+        return result
 
-    def _call(self, model: Any, messages: Any, errors: list[str], attempts: list[int]) -> Any:
+    def _retry_resting_primary(
+        self, messages: Any, errors: list[str], attempts: list[int], start: float
+    ) -> Any:
+        """The fallback failed while the primary rests: one more attempt of the primary."""
+        try:
+            result = self._call(self.primary, messages, errors, attempts, max_attempts=1)
+        except Exception:
+            self.health.primary_down_until = self.clock() + self.cooldown_s
+            self._record(self.primary_name, False, attempts, errors, start, retried=True)
+            raise
+        self.health.primary_down_until = 0.0  # it answered, so it rests no more
+        self._record(self.primary_name, False, attempts, errors, start, retried=True)
+        return result
+
+    def _call(
+        self,
+        model: Any,
+        messages: Any,
+        errors: list[str],
+        attempts: list[int],
+        max_attempts: int | None = None,
+    ) -> Any:
         def attempt() -> Any:
             attempts[0] += 1
             try:
@@ -169,7 +198,8 @@ class ResilientChat:
                 raise
 
         retrying = Retrying(
-            stop=stop_after_attempt(self.attempts) | stop_after_delay(self.retry_window_s),
+            stop=stop_after_attempt(max_attempts or self.attempts)
+            | stop_after_delay(self.retry_window_s),
             wait=wait_exponential_jitter(initial=1, max=4),
             retry=retry_if_exception(is_temporary),
             sleep=self.sleep,
@@ -177,9 +207,17 @@ class ResilientChat:
         )
         return retrying(attempt)
 
-    def _record(self, name, fallback, attempts, errors, start, skipped=False) -> None:
+    def _record(
+        self, name, fallback, attempts, errors, start, skipped=False, retried=False
+    ) -> None:
         self.health.last_call = CallInfo(
-            str(name), attempts[0], fallback, list(errors), self.clock() - start, skipped
+            str(name),
+            attempts[0],
+            fallback,
+            list(errors),
+            self.clock() - start,
+            skipped_primary=skipped,
+            primary_retried=retried,
         )
 
     def _derive(self, change: Callable[[Any], Any]) -> "ResilientChat":

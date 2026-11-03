@@ -410,3 +410,17 @@ def test_eval_writes_nothing_when_the_daily_quota_is_used_up(eval_file, tmp_path
     assert result.exit_code == 2
     assert "No results were written" in result.output
     assert not report.exists()
+
+
+def test_the_trace_shows_how_the_model_was_chosen():
+    span = {"span": "agent", "model": "small", "fallback": True, "attempts": 1}
+    resting = cli.span_details({**span, "skipped_primary": True})
+    assert "small (fallback)" in resting
+    assert "primary model resting" in resting
+
+    retried = cli.span_details(
+        {"span": "agent", "model": "big", "attempts": 2, "model_errors": ["503"]}
+        | {"primary_retried": True}
+    )
+    assert "errors: 503" in retried
+    assert "resting primary model got one more attempt" in retried

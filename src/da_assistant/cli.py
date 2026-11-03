@@ -276,6 +276,8 @@ def span_details(span: dict) -> str:
             text += f" (errors: {', '.join(span['model_errors'])})"
         if span.get("skipped_primary"):
             text += " (primary model resting after a failure)"
+        if span.get("primary_retried"):
+            text += " (the fallback failed, so the resting primary model got one more attempt)"
         calls = span.get("tool_calls") or []
         text += f", {tokens} -> " + (", ".join(calls) if calls else "answer")
     elif kind == "tool" and span.get("tool") == "run_sql":
