@@ -250,7 +250,9 @@ data has already left the warehouse.
   hold, so the assistant stays up. The trace marks such turns.
 - The prototype simulates identity with `--user`. Production takes it from IAP.
 
-**Red team:** 25 cases. [EVAL 11-03: cases held, leaks, which layer stopped each kind].
+**Red team:** 25 cases, all held, with no leaks. The guard stopped all 8 injections and all
+4 off-topic messages. The SQL rules rejected the queries in 6 of the 8 personal data cases.
+The safe views held all 5 other-brand cases.
 Names and coordinates have no pattern to search for. The safe views do not contain them at all.
 
 **Production adds:**
@@ -340,7 +342,8 @@ the prompt, and the case then passed in 4 of 4 tries.
 - Per turn: at most 8 model calls, 3 failed or empty queries and 5 GB scanned. Per query: at
   most 1 GB billed and 60 seconds.
 - If every group of a result is hidden, the model gets one coarser retry, then must answer.
-- Measured: [EVAL 11-03: model calls, cost and p95 latency per question].
+- Measured in the eval: 2.9 model calls per question on average (at most 7), $0.0027 per
+  question at list price, and 14.6 seconds at p95.
 
 **What we saw.** During development, Gemini Flash returned 503 and 504 errors again and again. The
 previous Flash version failed too. Flash-Lite answered in 0.7 seconds. One failed attempt took
@@ -351,6 +354,7 @@ previous Flash version failed too. Flash-Lite answered in 0.7 seconds. One faile
 - Wait at most 30 seconds per attempt, and 10 for the guard.
 - Then switch to the fallback model, in a different tier. It can take over mid-turn.
 - The failed model rests for 5 minutes, as a simple circuit breaker.
+- If the fallback fails while the primary rests, the primary gets one more attempt.
 - A used-up daily quota is not retried: the fallback model answers at once.
 
 **Quotas are a prototype limit, not a design limit.** The free tier gives 500 requests a day
@@ -359,7 +363,8 @@ Vertex AI, with Provisioned Throughput if the load needs it.
 
 **Service levels** (a first draft, to agree with the client):
 - 99.5% of turns in a month end without an error. A refusal counts as a success.
-- 95% of answers arrive in under 30 seconds. Today: [EVAL 11-03: p50 and p95 latency].
+- 95% of answers arrive in under 30 seconds. Today: 4.8 seconds at the median and 14.6
+  seconds at p95, in the eval.
 - When the error budget is spent, reliability work comes before new features.
 
 | What fails | What happens | What the user sees |
@@ -378,7 +383,7 @@ Terraform, so the stack can be rebuilt in another region.
 
 *Built: tests in CI and an eval. Production adds a judge model and a release gate.*
 
-**Every push:** 444 offline tests and lint run in GitHub Actions, with no keys. DuckDB stands
+**Every push:** 448 offline tests and lint run in GitHub Actions, with no keys. DuckDB stands
 in for BigQuery, so the SQL rules run for real.
 
 **Every release, the eval** (`da-assistant eval`):
@@ -389,7 +394,10 @@ in for BigQuery, so the SQL rules run for real.
 - Behavior checks: model calls, queries, guard blocks, masking hits, report sections.
 - The report shows pass counts with a 95% interval, the model that answered, and the layer
   that stopped each attack.
-- Results: [EVAL 11-03 and 11-04: pass counts, the failures and why], in `docs/eval-results-*.md`.
+- Results of the first run: 47 of 48 passed (95% interval 89% to 100%). Analysis 22 of 23,
+  red team 25 of 25, no leaks. The one failure: the model used the order date, not the date
+  of a sale from the prompt, so its numbers were about 1% off. Details in
+  `docs/eval-results-*.md`.
 
 **Do reports answer what the user meant?**
 - The numbers are checked against reference SQL.
@@ -474,14 +482,14 @@ included. This is called crypto-shredding.
 - The agent API keeps no state. State is in Cloud SQL, so Cloud Run can add instances freely.
 - A turn mostly waits for Gemini and BigQuery. Start at about 20 turns per instance, then load
   test. One instance stays warm, so there is no cold start. A maximum caps the spend.
-- Gemini: 1 to 8 calls per question ([EVAL 11-03: the average]). 50 questions a minute need
-  150 to 400 calls a minute. The Vertex AI quota is sized for that.
+- Gemini: 1 to 8 calls per question (3.5 on average for the eval's analysis questions).
+  50 questions a minute need 150 to 400 calls a minute. The Vertex AI quota is sized for that.
 - BigQuery: at most 1 GB billed per query, 5 GB per turn, and a daily quota per user.
 
 | Cost per month | Assumption | Per month |
 |---|---|---|
-| Questions (Gemini and BigQuery) | 50 users, 10 questions a working day: about 10,500, at [EVAL 11-03: cost per question] on Flash-Lite | [EVAL 11-03: about $X] |
-| The same on Flash | About 2 to 2.5 times the Flash-Lite cost | [EVAL 11-03: about $Y] |
+| Questions (Gemini and BigQuery) | 50 users, 10 questions a working day: about 10,500, at $0.0027 per question on Flash-Lite | About $28 |
+| The same on Flash | About 2 to 2.5 times the Flash-Lite cost | About $60 |
 | Always-on parts | Load balancer, one warm Cloud Run instance, a small Cloud SQL instance with a standby | $100 to $250 (rough estimate at list prices, not yet checked with the pricing calculator) |
 | Logging, Pub/Sub, vector search, embeddings | Mostly within free allowances | Under $20 |
 
