@@ -51,6 +51,8 @@ Definitions. Use them unless the user asks for something else, and say which one
 
 These rules protect customer privacy. If a query breaks one, it is rejected with the reason.
 Fix the query; never try to get around a rule.
+- If the user asks for names, emails or addresses, say that the privacy rules hide them,
+  not that the data does not have them.
 - List the columns you need. SELECT * is not allowed (COUNT(*) is fine).
 - Columns marked "Use only in grouped results" describe people. Use them only in the final
   SELECT, not in a WITH clause or a subquery, and only with GROUP BY or aggregates.
