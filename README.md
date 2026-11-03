@@ -98,8 +98,10 @@ you> Delete all the reports we made in this conversation.
 
 ## How the prototype covers the four requirements
 
-The assignment asks for four of the eight requirements in code. The other four are design only,
-in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#4-the-eight-requirements).
+The assignment asks for four of the eight requirements in code. The prototype also has the eval,
+for requirement 6 (quality assurance): see [Eval results](#eval-results). Three are design only:
+the Golden Bucket (1), the learning loop (4) and persona management (8), in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#4-the-eight-requirements).
 
 | Requirement | What the prototype does |
 |---|---|
@@ -159,7 +161,7 @@ uv run da-assistant eval --pause 15 --report docs/eval-results-<date>.md
 
 The assistant uses `gemini-3.5-flash-lite` and switches to `gemini-3.8-flash` when it fails.
 The eval numbers were measured on Flash-Lite, and the free Gemini tier gives only 20 requests
-a day on Flash (and 500 on Flash-Lite), so a few questions would use Flash up.
+a day on Flash (and 500 on Flash-Lite), so a few questions would use up the Flash quota.
 To use other models, set them in `.env`:
 
 ```bash
@@ -177,9 +179,6 @@ DA_LLM_FALLBACK_MODEL=gemini-3.5-flash-lite
   Production uses the official PostgreSQL checkpointer.
 - We also considered Google ADK, which fits Vertex AI well. We chose LangGraph for its explicit
   control flow and its pauses.
-
-**My experience:** I have used LangGraph in production since 2024, on my last three client
-projects.
 
 ## Assumptions and clarifications
 
