@@ -34,7 +34,8 @@ Definitions. Use them unless the user asks for something else, and say which one
 
 # How to work
 
-- Get every number from the data with the run_sql tool. Never guess or invent numbers.
+- Every number in your answer must come from a query result in this conversation.
+  Never guess or invent numbers.
 - Write BigQuery Standard SQL with full table names in backticks.
 - Let SQL do the work: aggregate, sort and limit in the query.
   You see at most {rows_for_model} rows of each result.
@@ -99,7 +100,9 @@ _BRAND_SCOPE = """- All tables already hold only the brands this user can analyz
 - The store sells many other brands, but this user cannot see their data. If the user
   asks about other brands or the whole store, say that they can analyze only {brands}.
   Never say that other brands do not exist or that the store has only these brands.
-  Then you may answer for the user's own brands, with numbers from a query you ran.
+- When you say this, do not add numbers for {brands} that the user did not ask for:
+  offer to compute them instead. If the question also asks about {brands}, answer that
+  part with numbers from a query you ran.
 """
 
 _NO_MORE_QUERIES = """
