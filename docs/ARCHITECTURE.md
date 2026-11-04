@@ -250,9 +250,10 @@ data has already left the warehouse.
   hold, so the assistant stays up. The trace marks such turns.
 - The prototype simulates identity with `--user`. Production takes it from IAP.
 
-**Red team:** 25 cases, all held, with no leaks. The guard stopped all 8 injections and all
-4 off-topic messages. The SQL rules rejected the queries in 6 of the 8 personal data cases.
-The safe views held all 5 other-brand cases.
+**Red team:** 25 cases, three full runs, no leaks. The guard stopped all 8 injections and all
+4 off-topic messages each time. The SQL rules rejected queries in 3 to 6 of the 8 personal
+data cases; in the others the model refused on its own. The safe views held all 5 other-brand
+cases.
 Names and coordinates have no pattern to search for. The safe views do not contain them at all.
 
 **Production adds:**
@@ -328,8 +329,14 @@ enforces "author only" in the database too. Per-report keys make the delete fina
   become notes in the prompt.
 - Every change passes the eval gate. The agent never rewrites its own prompt without review.
 
-We have run this loop once by hand. The eval caught an invented revenue number. We changed
-the prompt, and the case then passed in 4 of 4 tries.
+We have run this loop twice by hand:
+- The eval caught an invented revenue number. We changed the prompt, and the case then passed
+  in 4 of 4 tries.
+- Later, asked about another brand, the model still added made-up numbers for the user's own
+  brands: 3 of 5 tries for one question, and once in an eval run that passed, because the
+  check looked only for leaks. We added an eval check (every dollar amount must come from the
+  case's query results) and a stricter prompt. Made-up amounts went from 6 of 20 tries to 0
+  of 20.
 
 ### 4.5 Resilience and reliability
 
@@ -342,8 +349,8 @@ the prompt, and the case then passed in 4 of 4 tries.
 - Per turn: at most 8 model calls, 3 failed or empty queries and 5 GB scanned. Per query: at
   most 1 GB billed and 60 seconds.
 - If every group of a result is hidden, the model gets one coarser retry, then must answer.
-- Measured in the eval: 2.9 model calls per question on average (at most 7), $0.0027 per
-  question at list price, and 14.6 seconds at p95.
+- Measured in three eval runs: 2.6 to 2.9 model calls per question on average (at most 7),
+  $0.0024 to $0.0027 per question at list price, and 12.9 to 14.8 seconds at p95.
 
 **What we saw.** During development, Gemini Flash returned 503 and 504 errors again and again. The
 previous Flash version failed too. Flash-Lite answered in 0.7 seconds. One failed attempt took
@@ -363,8 +370,8 @@ Vertex AI, with Provisioned Throughput if the load needs it.
 
 **Service levels** (a first draft, to agree with the client):
 - 99.5% of turns in a month end without an error. A refusal counts as a success.
-- 95% of answers arrive in under 30 seconds. Today: 4.8 seconds at the median and 14.6
-  seconds at p95, in the eval.
+- 95% of answers arrive in under 30 seconds. Today, in three eval runs: 4.3 to 4.8 seconds at
+  the median and 12.9 to 14.8 seconds at p95.
 - When the error budget is spent, reliability work comes before new features.
 
 | What fails | What happens | What the user sees |
@@ -383,7 +390,7 @@ Terraform, so the stack can be rebuilt in another region.
 
 *Built: tests in CI and an eval. Production adds a judge model and a release gate.*
 
-**Every push:** 448 offline tests and lint run in GitHub Actions, with no keys. DuckDB stands
+**Every push:** 461 offline tests and lint run in GitHub Actions, with no keys. DuckDB stands
 in for BigQuery, so the SQL rules run for real.
 
 **Every release, the eval** (`da-assistant eval`):
@@ -391,18 +398,22 @@ in for BigQuery, so the SQL rules run for real.
   multi-step questions and reports. Some are definition traps.
 - 25 red-team cases: personal data, prompt injection, other brands, off-topic.
 - Known numbers come from reference SQL, run each time. A leaked number counts even when rounded.
+- In the other-brand cases, every dollar amount in the answer must come from the case's query
+  results, so a made-up number fails.
 - Behavior checks: model calls, queries, guard blocks, masking hits, report sections.
 - The report shows pass counts with a 95% interval, the model that answered, and the layer
   that stopped each attack.
-- Results of the first run: 47 of 48 passed (95% interval 89% to 100%). Analysis 22 of 23,
-  red team 25 of 25, no leaks. The one failure: the model used the order date, not the date
-  of a sale from the prompt, so its numbers were about 1% off. Details in
-  `docs/eval-results-*.md`.
+- Results: 47 of 48 in the first run, 47 of 48 in the second, and 48 of 48 after the fix for
+  made-up numbers (95% interval 93% to 100%). No leaks in any run. The failures: the model used
+  the order date, not the date of a sale from the prompt, so its numbers were about 1% off;
+  and for "Compare Carhartt with Diesel" it refused without computing Carhartt's own revenue.
+  Details in `docs/eval-results-*.md`.
 
 **Do reports answer what the user meant?**
 - The numbers are checked against reference SQL.
 - Grounding (production): every number in an answer must come from a query result of the
-  turn. This targets the invented-number failure.
+  turn. This targets the invented-number failure. The eval already checks dollar amounts this
+  way in the other-brand cases.
 - A judge model (production) scores reports. Does it answer the question? Does it state its
   definitions? Do the action items follow from the numbers? Is the tone right? The judge is
   first checked against about 50 reports labeled by analysts.
@@ -531,9 +542,12 @@ traces stay the same.
   all under 5 customers. The agent used to spend its whole budget on ever coarser cuts: 8
   model calls and $0.0109. With one retry allowed, it takes 6 calls and $0.0068. Production
   could merge small groups into "Other" or use BigQuery differential privacy.
-- **A model can invent a number.** The eval caught one case, and a prompt change fixed it in
-  re-tests. A prompt is not a guarantee. The grounding check and charts drawn from stored
-  results are the production answer.
+- **A model can invent a number.** Asked about another brand, it sometimes refused and then
+  added made-up numbers for the user's own brands (3 of 5 tries for one question). A stricter
+  prompt cut this from 6 of 20 tries to 0 of 20, and the eval now checks it in the other-brand
+  cases. Side effect: for one comparison question the model sometimes only offers to compute
+  the user's own number (2 of 3 tries). A prompt is not a guarantee. The grounding check in
+  code and charts drawn from stored results are the production answer.
 - **A model can drift from a definition.** In one eval case it left cancelled items out of a
   return rate, although the question said "all items". Answers state the definition used.
 - **The eval finds what it can search for.** Names and coordinates rely on the safe views,
