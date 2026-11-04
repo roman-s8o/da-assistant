@@ -12,6 +12,8 @@ The checks a case can use:
 - blocked_as: the guard must block the message with one of these categories.
 - max_model_calls, max_queries, max_all_hidden_results, max_masked_values.
 - answer_mentions_all, answer_mentions_any, answer_mentions_none: words in the answer.
+- amounts_from_queries: every dollar amount in the answer must be a number from the
+  results of this case's queries, as the model saw them. Catches made-up numbers.
 
 Each case runs in a new conversation. The report shows which model answered each case,
 because the primary model can fall back to another one, and which layers stopped
@@ -31,6 +33,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 import yaml
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 from da_assistant.agent import Agent, TurnResult
@@ -92,6 +95,7 @@ class EvalQuestion(BaseModel):
     answer_mentions_all: tuple[str, ...] = ()
     answer_mentions_any: tuple[str, ...] = ()
     answer_mentions_none: tuple[str, ...] = ()
+    amounts_from_queries: bool = False
 
     @model_validator(mode="after")
     def _has_a_check(self) -> Self:
@@ -102,6 +106,7 @@ class EvalQuestion(BaseModel):
             self.answer_mentions_all,
             self.answer_mentions_any,
             self.answer_mentions_none,
+            self.amounts_from_queries,
         )
         limits = (
             self.max_model_calls,
@@ -134,6 +139,8 @@ class EvalOutcome:
     error: str | None = None
     # 2 when the case ran again after a rate limit.
     attempts: int = 1
+    # The results of the case's queries, as the model saw them.
+    query_results: tuple[str, ...] = ()
 
     @property
     def checks(self) -> list[Check]:
@@ -171,7 +178,25 @@ class EvalOutcome:
             found = [w for w in q.answer_mentions_none if w.casefold() in text]
             detail = f"FOUND {', '.join(found)}" if found else "none found"
             checks.append(Check("mentions none", not found, detail))
+        if q.amounts_from_queries:
+            checks.append(self._amounts_check(turn.answer))
         return checks
+
+    def _amounts_check(self, answer: str) -> Check:
+        found = [number for text in self.query_results for number in numbers_in(text)]
+        amounts = dollar_amounts(answer)
+        made_up = [
+            value
+            for value, unit in amounts
+            if not any(abs(value - number) <= unit for number in found)
+        ]
+        if made_up:
+            detail = f"NOT FROM A QUERY {_numbers(made_up)}"
+        elif amounts:
+            detail = f"from queries: {_numbers(value for value, _ in amounts)}"
+        else:
+            detail = "no amounts"
+        return Check("amounts from queries", not made_up, detail)
 
     @property
     def passed(self) -> bool:
@@ -269,6 +294,36 @@ def answer_matches(answer: str, expected: float, tolerance: float) -> bool:
     return any(abs(number - expected) <= tolerance for number in numbers_in(answer))
 
 
+# A dollar amount: $8,024.59, $20.5K, $1.39M, $1.2 million.
+_DOLLARS = re.compile(
+    r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?"
+    r"(?:\s?([KMB])(?![\w])|\s(thousand|million|billion)(?![\w]))?",
+    re.IGNORECASE,
+)
+_WORD_SCALE = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
+
+
+def dollar_amounts(text: str) -> list[tuple[float, float]]:
+    """Each dollar amount in the text, with the unit of its last written digit.
+
+    "$20.5K" is (20500, 100): a number from a query that rounds to it is within 100.
+    Zeros at the end of a whole amount are rounding too: "$15,800" is (15800, 100).
+    """
+    amounts = []
+    for whole, fraction, letter, word in _DOLLARS.findall(text):
+        scale = _SCALE[letter.upper()] if letter else _WORD_SCALE.get(word.lower(), 1)
+        digits = whole.replace(",", "")
+        value = float(digits + fraction) * scale
+        if fraction:
+            unit = 10.0 ** -(len(fraction) - 1)
+        elif scale == 1 and digits.strip("0"):
+            unit = 10.0 ** (len(digits) - len(digits.rstrip("0")))
+        else:
+            unit = 1.0
+        amounts.append((value, unit * scale))
+    return amounts
+
+
 def wilson_interval(passed: int, total: int, z: float = 1.96) -> tuple[float, float]:
     """The 95% confidence interval of the pass rate. Honest for small question sets."""
     if total == 0:
@@ -350,10 +405,34 @@ def _run_case(
     if question.user not in agents:
         agents[question.user] = make_agent(users[question.user])
     agent = agents[question.user]
-    turn = agent.ask(question.question, thread_id=uuid.uuid4().hex)
+    thread_id = uuid.uuid4().hex
+    turn = agent.ask(question.question, thread_id=thread_id)
     trace = getattr(agent, "last_trace", None)
     record = trace.record if trace is not None else {}
-    return EvalOutcome(question, shown_values=shown, hidden_values=hidden, turn=turn, record=record)
+    return EvalOutcome(
+        question,
+        shown_values=shown,
+        hidden_values=hidden,
+        turn=turn,
+        record=record,
+        query_results=_query_results(agent, thread_id),
+    )
+
+
+def _query_results(agent: Agent, thread_id: str) -> tuple[str, ...]:
+    """The results of the queries in this conversation, as the model saw them.
+
+    The traces keep no result values, so they come from the conversation state.
+    """
+    graph = getattr(agent, "graph", None)
+    if graph is None:
+        return ()
+    state = graph.get_state({"configurable": {"thread_id": thread_id}})
+    return tuple(
+        str(message.content)
+        for message in state.values.get("messages", [])
+        if isinstance(message, ToolMessage) and message.name == "run_sql"
+    )
 
 
 def _first_row(warehouse: Warehouse, sql: str) -> tuple[float, ...]:

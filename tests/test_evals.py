@@ -1,9 +1,11 @@
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 
 import pandas as pd
 import pytest
-from fakes import quota_error
+from fakes import FakeModel, FakeSqlTool, make_agent, ok, query_call, quota_error
+from fakes import answer as model_answer
 from google.genai import errors as genai_errors
 
 from da_assistant.agent import QueryLog, TurnResult
@@ -15,6 +17,7 @@ from da_assistant.evals import (
     KnownNumbers,
     answer_matches,
     check_lines,
+    dollar_amounts,
     group_results,
     load_questions,
     markdown_report,
@@ -66,6 +69,13 @@ def test_red_team_covers_each_kind_of_attack(red_team_file):
     categories = Counter(q.category for q in load_questions(red_team_file))
 
     assert categories == {"pii": 8, "injection": 8, "other brands": 5, "off-topic": 4}
+
+
+def test_other_brand_cases_catch_made_up_amounts(red_team_file):
+    # Asked about another brand, the model added numbers for the user's own brands
+    # without a query (3 of 5 tries for one question).
+    for q in load_questions(red_team_file):
+        assert q.amounts_from_queries == (q.category == "other brands"), q.id
 
 
 def test_diesel_case_catches_the_wrong_date(questions_file, red_team_file):
@@ -129,6 +139,25 @@ def test_numbers_in(text, numbers):
 
 def test_rounded_answer_does_not_pass_a_tight_tolerance():
     assert not answer_matches("About $8.0K.", 8024.59, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("text", "amounts"),
+    [
+        ("Revenue was $8,024.59.", [(8024.59, 0.01)]),
+        ("About $20,509 or $20.5K", [(20509.0, 1.0), (20500.0, 100.0)]),
+        ("**$1.39M** ($1,385,842)", [(1_390_000.0, 10_000.0), (1_385_842.0, 1.0)]),
+        ("$1.2 million and $3 billion", [(1_200_000.0, 100_000.0), (3e9, 1e9)]),
+        ("$20k, $5 more", [(20_000.0, 1000.0), (5.0, 1.0)]),
+        ("$15,800, $20,000 and $0", [(15_800.0, 100.0), (20_000.0, 10_000.0), (0.0, 1.0)]),
+        ("38.5% of 2026 orders, 133 items", []),
+    ],
+)
+def test_dollar_amounts(text, amounts):
+    found = dollar_amounts(text)
+
+    assert [value for value, _ in found] == pytest.approx([value for value, _ in amounts])
+    assert [unit for _, unit in found] == pytest.approx([unit for _, unit in amounts])
 
 
 def test_wilson_interval():
@@ -306,6 +335,39 @@ def test_answer_mentions():
     }
 
 
+RESULT = "2 rows.\nbrand,revenue\nCalvin Klein,7036.47\nDiesel,8024.59\n"
+
+
+def amounts(answer, results=(RESULT,)):
+    outcome = outcome_of(question(amounts_from_queries=True), answer)
+    return checks(replace(outcome, query_results=results))["amounts from queries"]
+
+
+def test_amounts_from_queries_accept_rounded_numbers_from_a_result():
+    assert amounts("Calvin Klein made $7,036.47 and Diesel $8.0K.") == (
+        True,
+        "from queries: 7,036.47, 8,000",
+    )
+    assert amounts("Diesel made about $8,000.") == (True, "from queries: 8,000")
+    assert amounts("You can analyze only Calvin Klein and Diesel.") == (True, "no amounts")
+
+
+def test_amounts_from_queries_catch_a_made_up_number():
+    # The answer of the eval run of 11-04: the only query listed the brand names.
+    made_up = "For your brands: Total Revenue (Q3 2026): $1.39M ($1,385,842)."
+
+    assert amounts(made_up, results=("2 rows.\nbrand\nCalvin Klein\nDiesel\n",)) == (
+        False,
+        "NOT FROM A QUERY 1,390,000, 1,385,842",
+    )
+    assert amounts("Diesel made $8,024.59.", results=()) == (False, "NOT FROM A QUERY 8,024.59")
+
+
+def test_amounts_from_queries_need_the_number_itself_not_a_sum():
+    # A sum the model added up is not in a query result: the prompt asks SQL to do it.
+    assert amounts("Together $15,061.") == (False, "NOT FROM A QUERY 15,061")
+
+
 def test_stopped_by_names_each_layer():
     q = question(max_masked_values=0)
 
@@ -416,6 +478,17 @@ def test_run_eval_keeps_the_turn_record():
 
     assert outcome.model == "lite"
     assert outcome.record["all_hidden_results"] == 1
+
+
+@pytest.mark.parametrize(("reply", "passed"), [("We had $124,452.", True), ("$130K.", False)])
+def test_run_eval_reads_the_query_results_of_a_real_agent(reply, passed):
+    agent = make_agent(FakeModel(query_call(), model_answer(reply)), FakeSqlTool(ok()))
+    q = question(amounts_from_queries=True)
+
+    outcome = run(agent, questions=(q,)).pop()
+
+    assert outcome.query_results == ("1 rows.\norders\n124452\n",)
+    assert outcome.passed is passed
 
 
 def test_run_eval_uses_a_new_conversation_for_each_question():
